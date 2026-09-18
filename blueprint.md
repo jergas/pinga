@@ -48,7 +48,7 @@ the build step.
 | R5 | Offer **automatic and/or manual rename** | `auto_rename` toggle + `r` manual with prefilled suggestion |
 | R6 | Run **in and out of tmux** | `in_tmux()` branches launcher behavior |
 | R7 | Two **scrollable columns** (opencode \| codex) | Left/right lists scroll independently, wheel + `PgUp/PgDn` |
-| R8 | Navigate with **arrows**, plus **mouse** | Up/Down move selection; click selects & opens; wheel scrolls |
+| R8 | Navigate with **arrows**, plus **mouse** | Up/Down move selection; click selects, double-click or Enter opens; wheel scrolls |
 | R9 | In tmux: open session in **another window** of the same session | `tmux new-window -t <current session> -n <label> "<attach cmd>"` |
 | R10 | Own terminal: **pass control** of the terminal to the session, return when it exits | Suspend alt-screen + raw mode → run attach cmd with inherited stdio → re-enter |
 | R11 | **Mostly purple and green**, good readability | Palette in §14; text pairs meet WCAG-AA-ish contrast on the dark background |
@@ -222,6 +222,24 @@ re-render from the latest snapshots. No threads, no async — `crossterm`
 - **D7 Literate workflow = `make tangle` gate.** `src/` is derived; CI runs
   `cargo check`/`clippy`/`test` against tangled output so the document and code
   can't diverge silently.
+- **D8 One window per session, adopt-or-refuse.** Re-opening never spawns a
+  duplicate. Priority, per provider: (1) a tmux window pinga created (tracked
+  by window id) is selected again; (2) an untracked same-session window whose
+  process argv carries the session marker — `-s <id>` in `opencode attach`, or
+  the resume name in `codex resume <name>` — is adopted when unambiguous (the
+  pane's process tree is walked, so a TUI launched in a shell counts); (3)
+  opencode-only fallback: **no `-s` in the argv**, but exactly one `opencode
+  attach` window exists and this session is the newest-updated (`opencode`
+  bare `attach` binds to the most recent session) -> adopt it; several attach
+  windows, or one attached to a different session, are refused — this
+  opencode build exposes **no** per-session attachment signal, so anything
+  cross-terminal is undetectable and deliberately opens a fresh window
+  (documented gap); (4) otherwise a fresh window is created and tracked.
+  `f` forces past any refusal. codex has no liveness signal at all: only the
+  argv marker can adopt an already-open codex thread. Mouse: single
+  click selects, double-click (same cell, ≤ 500 ms) opens; `Enter` always
+  opens. Double-open is separate from repeat-open: the guard above is also
+  enforced for double-clicks.
 
 ## 9. Data contracts
 
@@ -310,6 +328,7 @@ ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+unicode-width = "0.1"
 ureq = { version = "2", default-features = false, features = ["json"] }
 ```
 
@@ -931,7 +950,7 @@ Decides tmux-window vs take-the-terminal **solely** on the presence of `$TMUX`
 the belt-and-braces check avoids the classic `${TMUX:+…}` footgun).
 
 ``` {.rust #core-launcher path="src/launcher.rs"}
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::process::{Command, Stdio};
 
 /// True when this process runs under tmux (R6/R9). tmux sets $TMUX.
@@ -947,15 +966,98 @@ fn current_tmux_session() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// R9: open a session in a NEW tmux window of the current tmux session.
-pub fn open_in_tmux(label: &str, command: &str) -> Result<()> {
+/// R9: open a session in a NEW tmux window of the current tmux session,
+/// returning the new window's id (@NNN) so D8 can select it on re-open.
+pub fn open_in_tmux_returning(label: &str, command: &str) -> Result<String> {
     let session = current_tmux_session()?;
-    let status = Command::new("tmux")
-        .args(["new-window", "-t", &session, "-n", label, command])
+    let out = Command::new("tmux")
+        .args(["new-window", "-P", "-F", "#{window_id}", "-t", &session, "-n", label, command])
+        .output()?;
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if id.is_empty() { return Err(anyhow!("tmux new-window failed")); }
+    Ok(id)
+}
+
+/// D8: bring an existing tmux window (by id, e.g. `@123` or `main:2`) to the
+/// foreground so "take me to the already-open one" works.
+pub fn tmux_select_window(win: &str) -> Result<()> {
+    let status = Command::new("tmux").args(["select-window", "-t", win])
         .stdout(Stdio::null()).stderr(Stdio::inherit())
         .status()?;
-    if !status.success() { return Err(anyhow::anyhow!("tmux new-window failed")); }
+    if !status.success() { return Err(anyhow!("tmux select-window failed")); }
     Ok(())
+}
+
+/// D8: is this window id still alive anywhere (tracked windows can be killed
+/// behind pinga's back)? Cheap grep over `list-windows -a`.
+pub fn tmux_window_alive(win: &str) -> Result<bool> {
+    let out = Command::new("tmux").args(["list-windows", "-a", "-F", "#{window_id}"]).output()?;
+    let hay = String::from_utf8_lossy(&out.stdout);
+    Ok(hay.lines().any(|line| line.trim() == win))
+}
+
+/// D8: find a window in the CURRENT tmux session that is already running this
+/// session. We walk each window's pane process tree looking for `marker` —
+/// the session id as it appears in `opencode attach <url> -s <id>`, or the
+/// resume name in `codex resume <name>`. Argv matching (not window names, which
+/// default to "codex"/"opencode") lets us adopt sessions the user opened by
+/// hand. Adopted only when exactly one window matches; ambiguous -> not found.
+pub fn find_open_window(marker: &str) -> Result<Option<String>> {
+    let session = current_tmux_session()?;
+    let out = Command::new("tmux").args(["list-windows", "-t", &session,
+        "-F", "#{window_id}\t#{pane_pid}"]).output()?;
+    let mut found: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut it = line.splitn(2, '\t');
+        let (Some(id), Some(pid)) = (it.next(), it.next()) else { continue };
+        if pid_runs_needles(pid.trim(), &[marker])? {
+            found.push(id.trim().to_string());
+        }
+    }
+    Ok(match found.len() {
+        1 => found.pop(),   // exactly one -> adopt
+        _ => None,          // none, or ambiguous -> treat as not found
+    })
+}
+
+/// D8 fallback: an `opencode attach` window whose argv carries no `-s <id>`
+/// (e.g. `opencode attach http://localhost:4096`) still counts as "this server
+/// is open in that window". Returns ALL matches; the caller decides adopt vs
+/// refuse on count + recency, since the server exposes no per-session
+/// attachment signal.
+pub fn find_opencode_attach_windows() -> Result<Vec<String>> {
+    let session = current_tmux_session()?;
+    let out = Command::new("tmux").args(["list-windows", "-t", &session,
+        "-F", "#{window_id}\t#{pane_pid}"]).output()?;
+    let mut found: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut it = line.splitn(2, '\t');
+        let (Some(id), Some(pid)) = (it.next(), it.next()) else { continue };
+        if pid_runs_needles(pid.trim(), &["opencode", "attach"])? {
+            found.push(id.trim().to_string());
+        }
+    }
+    Ok(found)
+}
+
+/// Does `pid` (or any descendant, bounded) have every `needle` in its argv?
+/// Handles sessions launched in an interactive shell, where the pane's process
+/// is the shell and the attach TUI is a child. Depth is capped so a long-lived
+/// shell's process tree can't balloon the walk.
+fn pid_runs_needles(pid: &str, needles: &[&str]) -> Result<bool> {
+    let mut stack: Vec<(String, u32)> = vec![(pid.to_string(), 0)];
+    while let Some((p, depth)) = stack.pop() {
+        let out = Command::new("ps").args(["-p", &p, "-o", "args="]).output()?;
+        let args = String::from_utf8_lossy(&out.stdout);
+        if needles.iter().all(|n| args.contains(n)) { return Ok(true); }
+        if depth >= 3 { continue; }
+        let children = Command::new("pgrep").args(["-P", &p]).output()?;
+        for c in String::from_utf8_lossy(&children.stdout).lines() {
+            let child = c.trim().to_string();
+            if !child.is_empty() { stack.push((child, depth + 1)); }
+        }
+    }
+    Ok(false)
 }
 
 /// R10: block in the foreground, inheriting the terminal, return on exit.
@@ -1037,8 +1139,24 @@ use crate::provider::{AnyProvider, Provider};
 
 use super::theme;
 
-const HELP: &str = "↑↓ select · ←→ column · Enter/click open · r rename · s suggest · m mouse · o auto · q quit";
+const HELP: &str = "↑↓ select · ←→ column · click select · double-click/Enter open · r rename · s suggest · m mouse · o auto · f force · q quit";
 pub const QUIT_MSG: &str = "quit";
+
+/// D8: two clicks on the same cell within this window count as one open.
+const DOUBLE_MS: Duration = Duration::from_millis(500);
+/// After a tmux window switch, swallow mouse downs for this long so a stray
+/// press can't be read as a new selection once pinga gets focus back.
+const SWITCH_COOLDOWN: Duration = Duration::from_millis(250);
+
+/// A mouse-initiated open that must wait until the button is released before
+/// touching the tmux window layout — switching mid-click lands the release
+/// (or a stray press) in the newly-faced attach TUI, which opencode reads as
+/// "click on message" -> its Message Actions popup.
+enum Plan {
+    Select { win: String },                    // window pinga created
+    Adopt { win: String, id: String },         // same session, opened by hand
+    Spawn { label: String, cmd: String, id: String },  // fresh window
+}
 
 pub struct App {
     cfg: Config,
@@ -1052,6 +1170,11 @@ pub struct App {
     mouse_on: bool,
     last_poll: Instant,
     error: Option<String>,
+    opened: Vec<(usize, String, String)>,   // (provider, session id, tmux window id) — D8
+    last_click: Option<(Instant, usize, usize)>,  // (time, column, row) — D8 double-click
+    force_open: bool,         // 'f' bypasses the D8 "already open elsewhere" refusal
+    pending: Option<Plan>,    // D8: deferred mouse open (executed on mouse Up)
+    mouse_ignore_until: Option<Instant>,  // D8: swallow stray downs after a switch
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1106,20 +1229,33 @@ impl App {
             providers,
             opencode: Vec::new(),
             codex: Vec::new(),
-            focus: 0,
+focus: 0,
             sel: [0, 0],
             naming: NameEngine::new(base, key, model),
             edited: None,
             mouse_on: false,
-            last_poll: Instant::now() - Duration::from_secs(3600),
+            last_poll: Instant::now(),
             error: None,
+            opened: Vec::new(),
+            last_click: None,
+            force_open: false,
+            pending: None,
+            mouse_ignore_until: None,
         }
     }
 
     fn provider(&self, i: usize) -> &AnyProvider { &self.providers[i] }
 
     fn refresh(&mut self) {
-        self.error = None;
+        // NOTE: self.error is NOT cleared here. Status lines like "already
+        // open … f to force" must STICK until the next user action, so they
+        // are cleared in handle_key / handle_mouse instead of vanishing on the
+        // next poll tick.
+        if let Some(plan) = self.pending.take() {
+            if let Err(e) = self.execute(plan) {
+                self.error = Some(e.to_string());
+            }
+        }
         match self.provider(0).list() {
             Ok(list) => { self.sel[0] = self.sel[0].min(list.len().saturating_sub(1)); self.opencode = list; }
             Err(e) => self.error = Some(e.to_string()),
@@ -1155,15 +1291,21 @@ impl App {
 
     fn handle_key(&mut self, code: KeyCode) -> anyhow::Result<()> {
         use KeyCode::*;
+        // A deferred mouse open that never got its Up (rare) is flushed here.
+        if let Some(plan) = self.pending.take() {
+            self.execute(plan)?;
+        }
+        self.error = None;   // any key dismisses a status line
         if self.edited.is_some() {
             return self.handle_rename_key(code);
         }
         // Arms that must propagate a Result leave early.
         match code {
             Char('q') | Esc => return Err(anyhow!(QUIT_MSG)),
-            Enter => return self.open_selected(),
+            Enter => return self.open_selected(false),
             Char('m') => return self.toggle_mouse(),
             Char('s') => return self.suggest_current(false),
+            Char('f') => return self.open_selected_force(),  // D8: bypass refusal
             _ => {}
         }
         // Pure state mutations; trailing Ok keeps the match unit-typed.
@@ -1216,16 +1358,123 @@ impl App {
         self.snapshots()[self.focus].get(self.sel[self.focus])
     }
 
-    fn open_selected(&mut self) -> anyhow::Result<()> {
+    fn open_selected(&mut self, from_mouse: bool) -> anyhow::Result<()> {
         let Some(s) = self.focused_session().cloned() else { return Ok(()) };
         let label = s.display_title().chars().take(24).collect::<String>();
         let cmd = self.provider(self.focus).attach_command(&s);
         if launcher::in_tmux() {
-            launcher::open_in_tmux(&label, &cmd)?;          // R9
+            self.open_in_tmux_guarded(&s, &label, &cmd, from_mouse)?;   // D8
         } else {
-            self.suspend_for(&cmd)?;                         // R10: pass control
+            // Bare-terminal mode: there is no alternate window to navigate to,
+            // so an opencode session attached elsewhere is refused unless 'f'.
+            if s.active && !self.force_open {
+                self.error = Some(format!("{} is already open elsewhere — f to force",
+                                          s.display_title()));
+                return Ok(());
+            }
+            self.suspend_for(&cmd)?;                            // R10: pass control
             self.refresh();
         }
+        self.force_open = false;
+        Ok(())
+    }
+
+    fn open_selected_force(&mut self) -> anyhow::Result<()> {
+        self.force_open = true;
+        self.open_selected(false)
+    }
+
+    /// D8: never spawn a second window for one session. Priority: tracked
+    /// window -> select it; a same-session window whose process argv carries
+    /// this session's marker -> adopt it; opencode `active` elsewhere -> refuse
+    /// (`f` forces); else create a fresh window and record its id.
+    fn open_in_tmux_guarded(&mut self, s: &Session, label: &str, cmd: &str,
+                            from_mouse: bool) -> anyhow::Result<()> {
+        if let Some((_, _, win)) = self.opened.iter()
+            .find(|(i, id, _)| *i == self.focus && *id == s.id)
+            .cloned()
+        {
+            if launcher::tmux_window_alive(&win)? {
+                return self.commit_or_defer(Plan::Select { win }, from_mouse);
+            }
+            self.opened.retain(|(i, id, _)| !(*i == self.focus && *id == s.id));
+            // Window was killed behind our back -> reopen below.
+        }
+        // Marker that appears in the attach argv (opencode `-s <id>`; codex
+        // `resume <name>`) so the adopt heuristic can't misfire on a bare
+        // `codex`/`opencode` window that isn't this session.
+        let marker = if self.focus == 0 {
+            s.id.clone()
+        } else {
+            s.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| s.id.clone())
+        };
+        if let Some(win) = launcher::find_open_window(&marker)? {
+            return self.commit_or_defer(Plan::Adopt { win, id: s.id.clone() }, from_mouse);
+        }
+        if self.focus == 0 {
+            // opencode fallback: an `attach` window without `-s <id>` can't be
+            // matched by argv. The server exposes no per-session attachment
+            // signal, so the safe heuristics are: exactly ONE attach window
+            // AND this session is the newest-updated (opencode's bare attach
+            // binds to the most recent session) -> adopt it; exactly one
+            // attach window on a DIFFERENT session -> this session is not open
+            // here, spawn normally; several attach windows -> ambiguous,
+            // refuse rather than silently copying.
+            let attach_wins = launcher::find_opencode_attach_windows()?;
+            if attach_wins.len() == 1 {
+                let is_newest = self.opencode.iter()
+                    .filter_map(|o| o.updated_ms)
+                    .max()
+                    .is_some_and(|mx| s.updated_ms.is_some_and(|up| up >= mx));
+                if is_newest {
+                    let win = attach_wins[0].clone();
+                    return self.commit_or_defer(Plan::Adopt { win, id: s.id.clone() }, from_mouse);
+                }
+            } else if !attach_wins.is_empty() && !self.force_open {
+                self.error = Some(format!("{} — {} opencode attach window(s); f to open a new one",
+                                          s.display_title(), attach_wins.len()));
+                return Ok(());
+            }
+        }
+        if s.active && !self.force_open {
+            self.error = Some(format!("{} is already open elsewhere — f to force",
+                                      s.display_title()));
+            return Ok(());
+        }
+        self.commit_or_defer(Plan::Spawn {
+            label: label.to_string(), cmd: cmd.to_string(), id: s.id.clone(),
+        }, from_mouse)
+    }
+
+    /// From a keyboard action the tmux change happens now; from a mouse
+    /// double-click it waits for the button to come up so the release of the
+    /// second click can't be delivered to the newly-faced attach TUI.
+    fn commit_or_defer(&mut self, plan: Plan, from_mouse: bool) -> anyhow::Result<()> {
+        self.force_open = false;
+        if from_mouse {
+            self.pending = Some(plan);
+            return Ok(());
+        }
+        self.execute(plan)
+    }
+
+    fn execute(&mut self, plan: Plan) -> anyhow::Result<()> {
+        match plan {
+            Plan::Select { win } => {
+                launcher::tmux_select_window(&win)?;       // take me to it
+            }
+            Plan::Adopt { win, id } => {
+                self.opened.push((self.focus, id, win.clone()));
+                launcher::tmux_select_window(&win)?;       // same session, not ours
+            }
+            Plan::Spawn { label, cmd, id } => {
+                let win = launcher::open_in_tmux_returning(&label, &cmd)?;
+                self.opened.push((self.focus, id, win));
+            }
+        }
+        // Any window layout change after a mouse open can leak a stray press;
+        // swallow down events for a beat so pinga doesn't act on it on return.
+        self.mouse_ignore_until = Some(Instant::now() + SWITCH_COOLDOWN);
         Ok(())
     }
 
@@ -1290,12 +1539,37 @@ impl App {
                 self.sel[self.focus] = self.sel[self.focus].saturating_sub(1);
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // A stray down right after a window switch is not a conscious
+                // click on our rows — drop it and reset double-click state.
+                if let Some(until) = self.mouse_ignore_until {
+                    if Instant::now() < until {
+                        self.mouse_ignore_until = None;
+                        self.last_click = None;
+                        return Ok(());
+                    }
+                }
+                self.error = None;   // any explicit click dismisses a status line
                 if let (Some(c), Some(r)) = (col, row) {
                     if r < self.snapshots()[c].len() {
                         self.focus = c;
                         self.sel[c] = r;
-                        return self.open_selected();           // R8 single click = open
+                        // D8: single click selects only; a quick second click
+                        // on the same cell opens (double-click pattern).
+                        let is_double = self.last_click
+                            .filter(|(t, pc, pr)| t.elapsed() < DOUBLE_MS && *pc == c && *pr == r)
+                            .is_some();
+                        self.last_click = Some((Instant::now(), c, r));
+                        if is_double {
+                            return self.open_selected(true);
+                        }
                     }
+                }
+            }
+            // The double-click's plan is executed when the button comes back
+            // up, so its release can't leak into the attach TUI we switch to.
+            MouseEventKind::Up(_) => {
+                if let Some(plan) = self.pending.take() {
+                    return self.execute(plan);
                 }
             }
             _ => {}
@@ -1314,7 +1588,14 @@ impl App {
         let header = Line::from(vec![
             Span::styled(" pinga ", theme::focus_style()),
             Span::styled(" · ", theme::dim_style()),
-            Span::styled(HELP, theme::dim_style()),
+            // Reserve the fixed prefix width (" pinga " + " · ") so the help
+            // text can never push past the right edge of the terminal.
+            Span::styled(
+                Self::fit(HELP, usize::from(vert[0].width).saturating_sub(
+                    unicode_width::UnicodeWidthStr::width(" pinga  · "),
+                )),
+                theme::dim_style(),
+            ),
         ]);
         f.render_widget(Paragraph::new(header).style(theme::surface_style()), vert[0]);
 
@@ -1325,21 +1606,44 @@ impl App {
             let text = edit.text();
             let cursor = edit.cursor();
             let before: String = text.chars().take(cursor).collect();
-            let after: String = text.chars().skip(cursor).collect();
+            let full_after: String = text.chars().skip(cursor).collect();
+            // Fit the line to the terminal width, keeping the cursor block
+            // and the [Enter/Esc] hint visible: trim the tail (after-cursor
+            // text) first when space runs out.
+            let hint = "  [Enter apply · Esc cancel]";
             let cursor_style = Style::default().bg(theme::FG).fg(theme::BG);
+            let budget = usize::from(area.width)
+                .saturating_sub(9 /* " rename: " */ + unicode_width::UnicodeWidthStr::width(before.as_str()) + 1 + hint.chars().count());
+            let after = Self::fit(&full_after, budget);
             let line = Line::from(vec![
                 Span::styled(" rename: ", theme::codex_accent()),
                 Span::styled(before, theme::text_style()),
                 Span::styled("▌", cursor_style),
                 Span::styled(after, theme::dim_style()),
-                Span::styled("  [Enter apply · Esc cancel]", theme::dim_style()),
+                Span::styled(hint, theme::dim_style()),
             ]);
             let rect = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
             f.render_widget(Paragraph::new(line).style(theme::surface_style()), rect);
         } else if let Some(e) = &self.error {
             let line = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
-            f.render_widget(Paragraph::new(e.clone()).style(theme::warn_style()), line);
+            f.render_widget(Paragraph::new(Self::fit(e, usize::from(area.width))).style(theme::warn_style()), line);
         }
+    }
+
+    /// Clip `text` to a budget of terminal COLUMNS (wide glyphs count double)
+    /// so a long line can't overflow the right edge of its rect.
+    fn fit(text: &str, max: usize) -> String {
+        use unicode_width::UnicodeWidthChar;
+        let mut s = String::new();
+        let mut w = 0usize;
+        for c in text.chars() {
+            if w + c.width().unwrap_or(0) > max {
+                break;
+            }
+            w += c.width().unwrap_or(0);
+            s.push(c);
+        }
+        s
     }
 
     fn render_column(&self, f: &mut Frame, area: Rect, idx: usize) {
@@ -1492,7 +1796,7 @@ fn run_console(cfg: config::Config) -> anyhow::Result<()> {
 | Provider (codex) | unit: build sessions from a fixture `session_index.jsonl` + rollout tree; rename appends a line | `cargo test` |
 | Naming | unit: heuristic caps ≤ 40; remote path mocked (deny offline) | `cargo test` |
 | Launcher | unit: `in_tmux()` true/false; run_in_foreground runs `sh -c` | `cargo test` |
-| Handoff (tmux) | manual on eris: click → new window in `main` holds the attach TUI | manual |
+| Handoff (tmux) | manual on eris: double-click or Enter → new window in `main` holds the attach TUI; re-open selects the same window, never a duplicate; single click does not open | manual |
 | Handoff (terminal) | manual: run pinga outside tmux, open a session, quit it, pinga redraws | manual |
 | Living integration | `make tangle && cargo check && cargo test` must pass | CI gate |
 | Readability | eyeball on eris terminal (truecolor); then dim-fg grid check §14 | manual |
@@ -1532,13 +1836,17 @@ only for `TERM` without color support.
    isolates that.
 3. **Auto-rename trigger definition.** "3 min old + default title" is a
    starting policy; make it config-driven (`auto_rename_min_age`).
-4. **Mouse double-click vs single-click-open.** Single click opens per R8
-   (both columns share the behavior). If that proves jumpy on fast scrolls,
-   switch to select-on-click / open-on-double with a `open_on_click` config
-   knob, keeping wheel-scroll on both.
+4. **RESOLVED: select-on-click / open-on-double.** A single click selects
+   only (leaving the mouse free for rename, column focus, etc.); a
+   double-click (same cell, ≤ 500 ms) or `Enter` opens — the pattern lazygit
+   uses, and it lets you tap rows without spawning windows. Wheel scroll is
+   unchanged. D8 keeps it one window per session.
 5. **pid-based session liveness.** `active` is best-effort; true liveness per
    session may need opencode's SSE event stream or `codex app-server` control —
-   defer until the console proves annoying without it.
+   defer until the console proves annoying without it. Empirically this opencode
+   build returns **no** `active` field, so the D8 `active` refusal is inert and
+   cross-session/terminal opencode attachment is undetectable (fresh window
+   allowed) — same gap codex always had, now the rule for both.
 6. **Empty-thread visibility.** `has_conversation` hides seed threads (vscode
    spawns an empty thread, resume closes it immediately). If a user legitimately
    reuses seeds, switch to surfacing them with a muted "(empty)" marker instead
