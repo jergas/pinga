@@ -62,3 +62,33 @@ all six and re-reads the session to confirm the title actually changed (rule in
 blueprint §16.3). External rename for codex = append {"id","thread_name",
 "updated_at"} to ~/.codex/session_index.jsonl (codex's own contract; newest
 append wins).
+
+## tmux-resurrect had NO save file until a systemd timer was added (2026-09-19)
+A power failure killed tmux with zero snapshot: `~/.tmux/resurrect/` was empty,
+so resurrect+continuum restored nothing despite being configured. Root cause:
+continuum only writes a save while a tmux server with the plugins loaded has
+been up past its 15-min interval — a quick power loss kills the server first.
+Fix: a systemd user timer (`pinga-tmux-save.service/.timer`,
+OnCalendar=`*:0/10`) runs `~/.tmux/plugins/tmux-resurrect/scripts/save.sh`
+via `tmux run-shell -t <any-session>` every 10 min, independent of server
+uptime. That script snapshots the WHOLE server (all sessions). Verify a save
+exists (`ls ~/.tmux/resurrect/`) before trusting reboot survival.
+
+## codex terminal sessions talk to the app-server daemon too (2026-09-19)
+A codex TUI's status shows `Remote: unix://~/.codex/app-server-control/...`.
+That socket IS the daemon — but for terminal sessions it's the control/metadata
+plane; the conversation itself persists as rollout files in `~/.codex/sessions`
+(which is what pinga lists). The app-server "Thread" protocol is IDE-oriented
+and is NOT how a new terminal session is minted — pinga's "+ new session" for
+codex opens `cd <dir> && codex`, which talks to the daemon and writes a rollout.
+So "opened in the server" is true for codex in the sense that matters
+(persistent), just not via the app-server protocol.
+
+## pinga's interrupted-session flag only fires at startup (2026-09-19)
+`opened` tracking persists to `~/.local/state/pinga/opened.json`. On the FIRST
+reconcile after startup, sessions in it whose window died are shown as
+"⚠ interrupted" (orphaned while pinga wasn't running). Once pinga is live, a
+tracked window that stops running its session (e.g. `/exit`) is DROPPED from
+tracking, never flagged interrupted — otherwise an intentional close shows as a
+false "interrupted". A session in `opened` but gone from the server is dropped
+with a one-time "removed from tracking" notice.

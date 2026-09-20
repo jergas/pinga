@@ -20,3 +20,18 @@
 - sticky status: `error` no longer cleared in refresh(); cleared on explicit key/mouse instead — refusal text persists until the user acts.
 - overflow: header HELP + bottom error line `fit`-truncated to terminal width; rename line keeps cursor+hint visible by trimming after-cursor text.
 - gates green (check/clippy/test).
+
+## D8 v5 + COMMIT fb93a60 (2026-09-18)
+- header overflow root cause: prefix " pinga " + " · " = 10 cols but only 8 reserved; now reserved via UnicodeWidthStr::width and fit() is column-aware (wide glyphs count 2) using unicode-width = 0.1 (pinned to ratatui's version to dedupe).
+- COMMIT fb93a60 "D8: click-to-open sessions with one-window-per-session enforcement" (4 files, +346/-26). Everything D8 in one commit. Remaining: proper codex manual test; user's older codex session may have been lost when other codex versions were uninstalled.
+
+## [2026-09-19] STEP -1 | pinga: "+ new session" + interrupted-session tracking
+- "-1a" — each column now has a "+ new session" row (visual row 0). Selecting it (Enter/dbl-click) opens a name+cwd form (Tab/Enter move name->cwd, Enter on cwd submits). opencode: POST /session (title+dir) then attach a window (verified: DELETE /session/:id works for cleanup). codex: opens `cd <dir> && codex` (codex has no server-side create; app-server protocol is IDE-oriented). Provider trait gained a default-error `create()`, overridden for opencode.
+- "-1b" — opened sessions persist to ~/.local/state/pinga/opened.json (dirs::state_dir). On each refresh pinga reconciles: tracked-but-gone-from-server -> dropped + one-time "removed from tracking" message; tracked-but-window-dead -> shown as "⚠ interrupted" resume row at top of column. Visual list is now VRow{New, Int, Sess} (always len+1 rows). Verified end-to-end in a throwaway tmux harness (create -> kill session -> restart shows interrupted; delete server-side -> reconcile message).
+- Selection bounds unchanged (visual_rows length == len+1 always). Sticky status message reapplies on re-entry.
+
+## [2026-09-19] STEPS 0-2 | pinga command, tmux 'pinga' session, reboot survival
+- STEP 0 — Makefile gained `install`/`uninstall` (tangle -> `cargo build --release` -> `install -Dm755 target/release/pinga ~/.local/bin/pinga`). `pinga` is now a real command on PATH. Fixed stale-binary trap: `make check/test` don't produce the executable; use `cargo build` or `make install`.
+- STEP 1 — created tmux session `pinga` with ONE window running the installed `pinga` (pinga opens all other sessions as windows).
+- STEP 2 — reboot survival: found `~/.tmux/resurrect/` had NO save file (why the 2026-09-18 power failure lost the layout). Added systemd user service+timer `pinga-tmux-save` (OnCalendar=`*:0/10`) calling resurrect `save.sh` via `tmux run-shell`; verified it writes a snapshot. Timer enabled; next run 23:30.
+- STEP 3 — documented the reality in ADR-0002 + gotchas (resurrect save gap, codex daemon socket, interrupted-session startup-only flag).

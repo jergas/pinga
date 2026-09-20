@@ -482,6 +482,13 @@ pub trait Provider: Send + Sync {
     fn rename(&self, session: &Session, title: &str) -> anyhow::Result<()>;
     /// Shell command that attaches to this session (client-mode, one server rule).
     fn attach_command(&self, session: &Session) -> String;
+    /// Create a fresh session server-side and return it. Providers that cannot
+    /// create sessions programmatically (codex) default to an error; the app
+    /// routes those to a `cd <dir> && <bin>` window instead.
+    fn create(&self, _name: &str, _dir: &str) -> anyhow::Result<Session> {
+        Err(anyhow::anyhow!("{} cannot create a session programmatically",
+                            self.kind().label()))
+    }
 }
 
 pub enum AnyProvider {
@@ -512,6 +519,12 @@ impl Provider for AnyProvider {
         match self {
             AnyProvider::Opencode(p) => p.attach_command(s),
             AnyProvider::Codex(p) => p.attach_command(s),
+        }
+    }
+    fn create(&self, name: &str, dir: &str) -> anyhow::Result<Session> {
+        match self {
+            AnyProvider::Opencode(p) => p.create(name, dir),
+            AnyProvider::Codex(p) => p.create(name, dir),
         }
     }
 }
@@ -636,12 +649,28 @@ impl OpencodeProvider {
         // Client-mode attach to the ONE shared server (never a bare opencode).
         format!("opencode attach {} -s {}", self.base, s.id)
     }
+
+    /// Create a fresh session on the shared server. The server binds sessions
+    /// to its own cwd (a "directory" in the payload is not honoured for the
+    /// global project), so the directory is accepted for symmetry but the
+    /// session lives wherever the server lives. Title lands directly.
+    fn create(&self, name: &str, dir: &str) -> Result<Session> {
+        let payload = serde_json::json!({ "directory": dir, "title": name });
+        let body: Value = self.agent.post(&format!("{}/session", self.base))
+            .send_json(&payload)?
+            .into_json()?;
+        if body.get("id").and_then(|i| i.as_str()).unwrap_or_default().is_empty() {
+            return Err(anyhow!("POST /session returned no id"));
+        }
+        Ok(Self::from_value(body))
+    }
 }
 
 impl crate::provider::Provider for OpencodeProvider {
     fn kind(&self) -> ProviderKind { ProviderKind::Opencode }
     fn list(&self) -> Result<Vec<Session>> { self.list() }
     fn rename(&self, s: &Session, t: &str) -> Result<()> { self.rename(s, t) }
+    fn create(&self, name: &str, dir: &str) -> Result<Session> { self.create(name, dir) }
     fn attach_command(&self, s: &Session) -> String { self.attach_command(s) }
 }
 ```
@@ -1040,6 +1069,21 @@ pub fn find_opencode_attach_windows() -> Result<Vec<String>> {
     Ok(found)
 }
 
+/// -1b: is a specific window currently RUNNING this session (its pane argv
+/// carries every `needle`)? Distinguishes "session still open" from "session
+/// closed but the window remained" — e.g. after `/exit`, the pane drops back
+/// to a shell, so the session should stop being tracked rather than be flagged
+/// as interrupted.
+pub fn window_runs(win: &str, needles: &[&str]) -> Result<bool> {
+    let out = Command::new("tmux").args(["list-panes", "-t", win, "-F", "#{pane_pid}"]).output()?;
+    for pid in String::from_utf8_lossy(&out.stdout).lines() {
+        let pid = pid.trim();
+        if pid.is_empty() { continue; }
+        if pid_runs_needles(pid, needles)? { return Ok(true); }
+    }
+    Ok(false)
+}
+
 /// Does `pid` (or any descendant, bounded) have every `needle` in its argv?
 /// Handles sessions launched in an interactive shell, where the pane's process
 /// is the shell and the attach TUI is a child. Depth is capped so a long-lived
@@ -1066,6 +1110,16 @@ pub fn run_in_foreground(command: &str) -> Result<()> {
     // quitting an attach TUI are a normal way to come back to pinga.
     Command::new("sh").arg("-c").arg(command).status()?;
     Ok(())
+}
+
+/// Quote a string for the shell so a path/name with spaces or quotes survives
+/// `sh -c` (used when composing `cd <dir> && <bin>` for a fresh codex window).
+pub fn shell_quote(s: &str) -> String {
+    if s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/') {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 ```
 
@@ -1119,6 +1173,7 @@ or R10 (take the terminal, come back).
 
 ``` {.rust #tui-app path="src/tui/app.rs"}
 use std::io::Stdout;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -1139,7 +1194,7 @@ use crate::provider::{AnyProvider, Provider};
 
 use super::theme;
 
-const HELP: &str = "↑↓ select · ←→ column · click select · double-click/Enter open · r rename · s suggest · m mouse · o auto · f force · q quit";
+const HELP: &str = "↑↓ select · ←→ column · click select · dbl-click/Enter open · Enter on '+' new · r rename · s suggest · m mouse · o auto · f force · q quit";
 pub const QUIT_MSG: &str = "quit";
 
 /// D8: two clicks on the same cell within this window count as one open.
@@ -1158,6 +1213,18 @@ enum Plan {
     Spawn { label: String, cmd: String, id: String },  // fresh window
 }
 
+/// One row of a column's visual list, in display order: the fixed "+ new
+/// session" row, then any interrupted (orphaned) sessions, then the rest.
+#[derive(Debug, Clone, Copy)]
+enum VRow { New, Int(usize), Sess(usize) }
+
+/// The bottom-line editor modes. Rename edits one title; NewSession is a
+/// two-field form (name then working directory) for the "+ new session" row.
+enum EditState {
+    Rename(TextEdit),
+    NewSession { name: TextEdit, cwd: TextEdit, field: u8 },  // 0 = name, 1 = cwd
+}
+
 pub struct App {
     cfg: Config,
     providers: Vec<AnyProvider>,
@@ -1166,15 +1233,18 @@ pub struct App {
     focus: usize,             // 0 = opencode, 1 = codex
     sel: [usize; 2],          // selected row index per column
     naming: NameEngine,
-    edited: Option<TextEdit>,  // Some(editor) => rename input mode
+    edited: Option<EditState>,  // Some(editor) => bottom-line input mode
     mouse_on: bool,
     last_poll: Instant,
     error: Option<String>,
     opened: Vec<(usize, String, String)>,   // (provider, session id, tmux window id) — D8
+    interrupted: [Vec<String>; 2],  // ids in each column orphaned by a crash (window dead)
     last_click: Option<(Instant, usize, usize)>,  // (time, column, row) — D8 double-click
     force_open: bool,         // 'f' bypasses the D8 "already open elsewhere" refusal
     pending: Option<Plan>,    // D8: deferred mouse open (executed on mouse Up)
     mouse_ignore_until: Option<Instant>,  // D8: swallow stray downs after a switch
+    needs_clear: bool,     // after a bare-terminal suspend, force a full repaint
+    did_startup_reconcile: bool,  // interrupted-flagging runs once, at startup
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1236,11 +1306,14 @@ focus: 0,
             mouse_on: false,
             last_poll: Instant::now(),
             error: None,
-            opened: Vec::new(),
+            opened: load_opened_state(),
+            interrupted: [Vec::new(), Vec::new()],
             last_click: None,
             force_open: false,
             pending: None,
             mouse_ignore_until: None,
+            needs_clear: false,
+            did_startup_reconcile: false,
         }
     }
 
@@ -1257,17 +1330,116 @@ focus: 0,
             }
         }
         match self.provider(0).list() {
-            Ok(list) => { self.sel[0] = self.sel[0].min(list.len().saturating_sub(1)); self.opencode = list; }
+            Ok(list) => { self.sel[0] = self.sel[0].min(list.len()); self.opencode = list; }
             Err(e) => self.error = Some(e.to_string()),
         }
         match self.provider(1).list() {
-            Ok(list) => { self.sel[1] = self.sel[1].min(list.len().saturating_sub(1)); self.codex = list; }
+            Ok(list) => { self.sel[1] = self.sel[1].min(list.len()); self.codex = list; }
             Err(e) => self.error = Some(e.to_string()),
         }
+        self.compute_interrupted();
         self.last_poll = Instant::now();
     }
 
+    /// Reconcile the persisted "opened" list against the servers. For each
+    /// entry pinga opened previously: if the session no longer exists on the
+    /// server it was dropped/deleted there — remove it from tracking and tell
+    /// the user once. If it still exists but its tmux window is dead, the
+    /// session was orphaned (e.g. a power failure) — mark it "interrupted" so
+    /// the user can resume it. Persist any reconciliation back to disk.
+    fn compute_interrupted(&mut self) {
+        // Only the FIRST reconcile (right after startup) may flag sessions as
+        // "interrupted": those windows died while pinga was NOT running to see
+        // them close, so a crash/reboot orphaned them. Once pinga is live, a
+        // tracked window that dies means the user closed the session — drop it
+        // from tracking instead, so an intentional /exit never shows as
+        // interrupted (and is never wrongly carried into the next startup).
+        let first = !self.did_startup_reconcile;
+        self.did_startup_reconcile = true;
+        let mut interrupted: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+        let mut gone = 0usize;
+        let mut kept: Vec<(usize, String, String)> = Vec::new();
+        let mut changed = false;
+        // Snapshot which session ids exist on each server before draining the
+        // tracked list, so the immutable read doesn't clash with the mutable
+        // move below.
+        let server_ids: Vec<Vec<String>> = self.snapshots().iter()
+            .map(|v| v.iter().map(|s| s.id.clone()).collect())
+            .collect();
+        for (p, id, win) in std::mem::take(&mut self.opened) {
+            let exists = server_ids[p].contains(&id);
+            if !exists {
+                // Session vanished server-side (deleted/expired). Drop tracking.
+                gone += 1;
+                changed = true;
+                continue;
+            }
+            let alive = launcher::tmux_window_alive(&win).unwrap_or(false);
+            if !alive {
+                if first {
+                    // Window gone while pinga wasn't running — orphaned by a
+                    // crash/reboot. Offer it for resume.
+                    interrupted[p].push(id.clone());
+                    kept.push((p, id, win));
+                } else {
+                    // pinga is live and the window is gone: the user closed it.
+                    changed = true;
+                }
+                continue;
+            }
+            // Window alive: is the session still attached in it, or did the
+            // user close it (e.g. /exit leaves the pane as a shell)?
+            let marker = self.session_marker(p, &id);
+            let running = launcher::window_runs(&win, &[marker.as_str()]).unwrap_or(false);
+            if running {
+                kept.push((p, id, win));   // still open — keep tracking
+            } else {
+                changed = true;            // closed by the user — stop tracking
+            }
+        }
+        self.opened = kept;
+        self.interrupted = interrupted;
+        if changed { save_opened_state(&self.opened); }
+        if gone > 0 {
+            self.error = Some(format!(
+                "{gone} session(s) pinga had open no longer exist on the server — removed from tracking"
+            ));
+        }
+    }
+
+    /// The argv marker that proves a tracked window is still running this
+    /// session: opencode's `-s <id>`, or codex's `resume <name>`.
+    fn session_marker(&self, p: usize, id: &str) -> String {
+        if p == 0 { return id.to_string(); }
+        self.snapshots()[p].iter().find(|s| s.id == id)
+            .and_then(|s| s.title.clone()).filter(|t| !t.is_empty())
+            .unwrap_or_else(|| id.to_string())
+    }
+
     fn snapshots(&self) -> [&Vec<Session>; 2] { [&self.opencode, &self.codex] }
+
+    /// Visual row count for a column: the sessions plus the fixed "+ new
+    /// session" row at index 0.
+    /// Visual rows for a column, in display order: the fixed "+ new session" row,
+    /// then interrupted (orphaned) sessions, then the remaining sessions.
+    fn visual_rows(&self, idx: usize) -> Vec<VRow> {
+        let snap = &self.snapshots()[idx];
+        let mut v = Vec::with_capacity(snap.len() + 1);
+        v.push(VRow::New);
+        for (i, s) in snap.iter().enumerate() {
+            if self.interrupted[idx].iter().any(|id| id == &s.id) { v.push(VRow::Int(i)); }
+        }
+        for (i, s) in snap.iter().enumerate() {
+            if !self.interrupted[idx].iter().any(|id| id == &s.id) { v.push(VRow::Sess(i)); }
+        }
+        v
+    }
+
+    /// Number of visual rows (used for selection clamping / scroll bounds).
+    fn list_len(&self, idx: usize) -> usize { self.visual_rows(idx).len() }
+
+    /// The focused row is the "+ new session" element (visual row 0).
+    fn on_new_row(&self) -> bool { self.sel[self.focus] == 0 }
 
     /// Run the event loop; returns when the user quits.
     pub fn run(&mut self, term: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
@@ -1285,6 +1457,14 @@ focus: 0,
                 },
                 false => self.refresh(),
             }
+            // After a bare-terminal child (an attach TUI) has run on this same
+            // terminal, its writes clobbered cells ratatui's diff buffer thinks
+            // are unchanged, so a normal draw can leave stale content. Force a
+            // full repaint so the list actually comes back.
+            if self.needs_clear {
+                term.clear()?;
+                self.needs_clear = false;
+            }
             term.draw(|f| self.render(f))?;
         }
     }
@@ -1297,7 +1477,7 @@ focus: 0,
         }
         self.error = None;   // any key dismisses a status line
         if self.edited.is_some() {
-            return self.handle_rename_key(code);
+            return self.handle_edit_key(code);
         }
         // Arms that must propagate a Result leave early.
         match code {
@@ -1311,8 +1491,8 @@ focus: 0,
         // Pure state mutations; trailing Ok keeps the match unit-typed.
         match code {
             Up => self.sel[self.focus] = self.sel[self.focus].saturating_sub(1),
-            Down => {
-                let n = self.snapshots()[self.focus].len().saturating_sub(1);
+Down => {
+                let n = self.snapshots()[self.focus].len();   // last session row
                 self.sel[self.focus] = (self.sel[self.focus] + 1).min(n);
             }
             Left | Char('h') if self.focus > 0 => self.focus -= 1,
@@ -1334,31 +1514,84 @@ focus: 0,
         Ok(())
     }
 
-    fn handle_rename_key(&mut self, code: KeyCode) -> anyhow::Result<()> {
+    fn handle_edit_key(&mut self, code: KeyCode) -> anyhow::Result<()> {
         use KeyCode::*;
-        match code {
-            Enter => {
-                let title = self.edited.take().map(|e| e.text()).unwrap_or_default();
-                self.apply_rename_to_focused(&title)?;
-                Ok(())
+        match &mut self.edited {
+            Some(EditState::Rename(e)) => match code {
+                Enter => {
+                    let title = e.text();
+                    self.edited = None;
+                    self.apply_rename_to_focused(&title)?;
+                    Ok(())
+                }
+                Esc => { self.edited = None; Ok(()) }
+                Backspace => { e.backspace(); Ok(()) }
+                Delete => { e.delete(); Ok(()) }
+                Left => { e.cursor_left(); Ok(()) }
+                Right => { e.cursor_right(); Ok(()) }
+                Home => { e.home(); Ok(()) }
+                End => { e.end(); Ok(()) }
+                Char(c) => { e.insert(c); Ok(()) }
+                _ => Ok(()),
+            },
+            Some(EditState::NewSession { name, cwd, field }) => {
+                match code {
+                    Esc => { self.edited = None; Ok(()) }
+                    Tab => { *field = 1 - *field; Ok(()) }
+                    Enter => {
+                        if *field == 0 {
+                            *field = 1;   // name -> cwd
+                            Ok(())
+                        } else {
+                            let name = name.text();
+                            let cwd = cwd.text();
+                            self.edited = None;
+                            self.create_new_session(&name, &cwd)
+                        }
+                    }
+                    // Text-editing keys act on whichever field is active. The
+                    // `active` borrow is scoped to this arm so it can't clash
+                    // with the immutable `name`/`cwd` reads in the Enter arm.
+                    _ => {
+                        let active = if *field == 0 { name } else { cwd };
+                        match code {
+                            Backspace => { active.backspace(); Ok(()) }
+                            Delete => { active.delete(); Ok(()) }
+                            Left => { active.cursor_left(); Ok(()) }
+                            Right => { active.cursor_right(); Ok(()) }
+                            Home => { active.home(); Ok(()) }
+                            End => { active.end(); Ok(()) }
+                            Char(c) => { active.insert(c); Ok(()) }
+                            _ => Ok(()),
+                        }
+                    }
+                }
             }
-            Esc => { self.edited = None; Ok(()) }
-            Backspace => { if let Some(e) = &mut self.edited { e.backspace(); } Ok(()) }
-            Delete => { if let Some(e) = &mut self.edited { e.delete(); } Ok(()) }
-            Left => { if let Some(e) = &mut self.edited { e.cursor_left(); } Ok(()) }
-            Right => { if let Some(e) = &mut self.edited { e.cursor_right(); } Ok(()) }
-            Home => { if let Some(e) = &mut self.edited { e.home(); } Ok(()) }
-            End => { if let Some(e) = &mut self.edited { e.end(); } Ok(()) }
-            Char(c) => { if let Some(e) = &mut self.edited { e.insert(c); } Ok(()) }
-            _ => Ok(()),
+            None => Ok(()),
         }
     }
 
     fn focused_session(&self) -> Option<&Session> {
-        self.snapshots()[self.focus].get(self.sel[self.focus])
+        match self.visual_rows(self.focus).get(self.sel[self.focus]) {
+            Some(VRow::Int(i)) | Some(VRow::Sess(i)) => self.snapshots()[self.focus].get(*i),
+            _ => None,
+        }
     }
 
     fn open_selected(&mut self, from_mouse: bool) -> anyhow::Result<()> {
+        if self.on_new_row() {
+            // "+ new session": open the name/cwd form, cwd prefilled with
+            // pinga's current directory for convenience.
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.edited = Some(EditState::NewSession {
+                name: TextEdit::new(""),
+                cwd: TextEdit::new(&cwd),
+                field: 0,
+            });
+            return Ok(());
+        }
         let Some(s) = self.focused_session().cloned() else { return Ok(()) };
         let label = s.display_title().chars().take(24).collect::<String>();
         let cmd = self.provider(self.focus).attach_command(&s);
@@ -1382,6 +1615,49 @@ focus: 0,
     fn open_selected_force(&mut self) -> anyhow::Result<()> {
         self.force_open = true;
         self.open_selected(false)
+    }
+
+    /// Spawn a fresh window for a brand-new session (no dedup — the session
+    /// didn't exist a moment ago). tmux: new window + track it; bare: pass the
+    /// terminal and come back.
+    fn spawn_new(&mut self, label: &str, cmd: &str, id: &str) -> anyhow::Result<()> {
+        if launcher::in_tmux() {
+            let win = launcher::open_in_tmux_returning(label, cmd)?;
+            self.opened.push((self.focus, id.to_string(), win));
+            save_opened_state(&self.opened);
+            self.mouse_ignore_until = Some(Instant::now() + SWITCH_COOLDOWN);
+        } else {
+            self.suspend_for(cmd)?;
+            self.refresh();
+        }
+        Ok(())
+    }
+
+    /// The "+ new session" row's submit: create + open in the focused harness.
+    fn create_new_session(&mut self, name: &str, cwd: &str) -> anyhow::Result<()> {
+        let name = name.trim();
+        let dir = if cwd.trim().is_empty() {
+            std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
+        } else { cwd.trim().to_string() };
+        let label = if name.is_empty() {
+            None
+        } else {
+            Some(name.chars().take(24).collect::<String>())
+        };
+        if self.focus == 0 {
+            let s = self.provider(0).create(name, &dir)?;
+            let label = label.unwrap_or_else(|| s.display_title().chars().take(24).collect::<String>());
+            let cmd = self.provider(0).attach_command(&s);
+            self.spawn_new(&label, &cmd, &s.id)
+        } else {
+            // codex has no server-side create: open a bare `codex` in the
+            // directory and let it mint its own session. The requested name
+            // becomes the tmux window label; the thread itself is named by
+            // codex (rename with 'r' later for something specific).
+            let cmd = format!("cd {} && codex", launcher::shell_quote(&dir));
+            let label = label.unwrap_or_else(|| "codex".to_string());
+            self.spawn_new(&label, &cmd, "")
+        }
     }
 
     /// D8: never spawn a second window for one session. Priority: tracked
@@ -1472,6 +1748,7 @@ focus: 0,
                 self.opened.push((self.focus, id, win));
             }
         }
+        save_opened_state(&self.opened);
         // Any window layout change after a mouse open can leak a stray press;
         // swallow down events for a beat so pinga doesn't act on it on return.
         self.mouse_ignore_until = Some(Instant::now() + SWITCH_COOLDOWN);
@@ -1488,6 +1765,7 @@ focus: 0,
         if self.mouse_on {
             crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
         }
+        self.needs_clear = true;   // full repaint next frame (child clobbered the screen)
         Ok(())
     }
 
@@ -1499,14 +1777,14 @@ focus: 0,
             self.provider(self.focus).rename(&s, &name)?;
             self.refresh();
         } else {
-            self.edited = Some(TextEdit::new(&name));   // prefill for manual rename (R4/R5)
+            self.edited = Some(EditState::Rename(TextEdit::new(&name)));   // prefill for manual rename (R4/R5)
         }
         Ok(())
     }
 
     fn start_rename(&mut self) {
         let pre = self.focused_session().map(|s| s.display_title().to_string()).unwrap_or_default();
-        self.edited = Some(TextEdit::new(&pre));
+        self.edited = Some(EditState::Rename(TextEdit::new(&pre)));
     }
 
     fn apply_rename_to_focused(&mut self, title: &str) -> anyhow::Result<()> {
@@ -1532,7 +1810,7 @@ focus: 0,
         let (col, row) = hit_rect(m.column, m.row, left, right);
         match m.kind {
             MouseEventKind::ScrollDown => {
-                let n = self.snapshots()[self.focus].len().saturating_sub(1);
+                let n = self.snapshots()[self.focus].len();
                 self.sel[self.focus] = (self.sel[self.focus] + 1).min(n);
             }
             MouseEventKind::ScrollUp => {
@@ -1550,7 +1828,7 @@ focus: 0,
                 }
                 self.error = None;   // any explicit click dismisses a status line
                 if let (Some(c), Some(r)) = (col, row) {
-                    if r < self.snapshots()[c].len() {
+                    if r <= self.snapshots()[c].len() {
                         self.focus = c;
                         self.sel[c] = r;
                         // D8: single click selects only; a quick second click
@@ -1603,31 +1881,63 @@ focus: 0,
         self.render_column(f, right, 1);
 
         if let Some(edit) = &self.edited {
-            let text = edit.text();
-            let cursor = edit.cursor();
-            let before: String = text.chars().take(cursor).collect();
-            let full_after: String = text.chars().skip(cursor).collect();
-            // Fit the line to the terminal width, keeping the cursor block
-            // and the [Enter/Esc] hint visible: trim the tail (after-cursor
-            // text) first when space runs out.
-            let hint = "  [Enter apply · Esc cancel]";
-            let cursor_style = Style::default().bg(theme::FG).fg(theme::BG);
-            let budget = usize::from(area.width)
-                .saturating_sub(9 /* " rename: " */ + unicode_width::UnicodeWidthStr::width(before.as_str()) + 1 + hint.chars().count());
-            let after = Self::fit(&full_after, budget);
-            let line = Line::from(vec![
-                Span::styled(" rename: ", theme::codex_accent()),
-                Span::styled(before, theme::text_style()),
-                Span::styled("▌", cursor_style),
-                Span::styled(after, theme::dim_style()),
-                Span::styled(hint, theme::dim_style()),
-            ]);
+            let line = match edit {
+                EditState::Rename(e) => self.rename_line(e, area.width),
+                EditState::NewSession { name, cwd, field } => self.new_session_line(name, cwd, *field, area.width),
+            };
             let rect = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
             f.render_widget(Paragraph::new(line).style(theme::surface_style()), rect);
         } else if let Some(e) = &self.error {
             let line = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
             f.render_widget(Paragraph::new(Self::fit(e, usize::from(area.width))).style(theme::warn_style()), line);
         }
+    }
+
+    /// Bottom-line for the rename editor: keep the cursor block and the
+    /// [Enter/Esc] hint visible by trimming the after-cursor text when short.
+    fn rename_line(&self, e: &TextEdit, width: u16) -> Line<'_> {
+        let text = e.text();
+        let cursor = e.cursor();
+        let before: String = text.chars().take(cursor).collect();
+        let full_after: String = text.chars().skip(cursor).collect();
+        let hint = "  [Enter apply · Esc cancel]";
+        let cursor_style = Style::default().bg(theme::FG).fg(theme::BG);
+        let budget = usize::from(width)
+            .saturating_sub(9 /* " rename: " */ + unicode_width::UnicodeWidthStr::width(before.as_str()) + 1 + hint.chars().count());
+        let after = Self::fit(&full_after, budget);
+        Line::from(vec![
+            Span::styled(" rename: ", theme::codex_accent()),
+            Span::styled(before, theme::text_style()),
+            Span::styled("▌", cursor_style),
+            Span::styled(after, theme::dim_style()),
+            Span::styled(hint, theme::dim_style()),
+        ])
+    }
+
+    /// Bottom-line for the "+ new session" form (one field at a time).
+    fn new_session_line(&self, name: &TextEdit, cwd: &TextEdit, field: u8, width: u16) -> Line<'_> {
+        let (label, e, hint) = if field == 0 {
+            (" name: ", name, "  [Tab cwd · Enter next · Esc cancel]")
+        } else {
+            (" cwd: ", cwd, "  [Tab name · Enter create · Esc cancel]")
+        };
+        let text = e.text();
+        let cursor = e.cursor();
+        let before: String = text.chars().take(cursor).collect();
+        let full_after: String = text.chars().skip(cursor).collect();
+        let cursor_style = Style::default().bg(theme::FG).fg(theme::BG);
+        let prefix = unicode_width::UnicodeWidthStr::width(" new session") + unicode_width::UnicodeWidthStr::width(label);
+        let budget = usize::from(width)
+            .saturating_sub(prefix + unicode_width::UnicodeWidthStr::width(before.as_str()) + 1 + hint.chars().count());
+        let after = Self::fit(&full_after, budget);
+        Line::from(vec![
+            Span::styled(" new session", theme::codex_accent()),
+            Span::styled(label, theme::dim_style()),
+            Span::styled(before, theme::text_style()),
+            Span::styled("▌", cursor_style),
+            Span::styled(after, theme::dim_style()),
+            Span::styled(hint, theme::dim_style()),
+        ])
     }
 
     /// Clip `text` to a budget of terminal COLUMNS (wide glyphs count double)
@@ -1658,22 +1968,61 @@ focus: 0,
         f.render_widget(&block, area);
 
         let mut items: Vec<ListItem> = Vec::new();
-        if snap.is_empty() {
-            items.push(ListItem::new(Line::from(Span::styled(" (no sessions)", theme::dim_style()))));
-        }
-        for (i, s) in snap.iter().enumerate() {
-            let selected = i == self.sel[idx];
-            let marker = if s.active { "●" } else { "·" };
-            let title_style = if selected { theme::selected_style() } else { theme::text_style() };
-            let meta_style = if selected { Style::default().fg(theme::DIM) } else { theme::dim_style() };
-            let spans = vec![
-                Span::styled(format!(" {marker} "), theme::dim_style()),
-                Span::styled(s.display_title(), title_style),
-                Span::styled(format!(" {}", s.age(now_ms())), meta_style),
-            ];
-            items.push(ListItem::new(Line::from(spans)));
+        for (visual, row) in self.visual_rows(idx).into_iter().enumerate() {
+            let selected = visual == self.sel[idx];
+            match row {
+                VRow::New => {
+                    let style = if selected { theme::selected_style() } else { theme::codex_accent() };
+                    items.push(ListItem::new(Line::from(Span::styled(" + new session", style))));
+                }
+                // Interrupted = orphaned by a crash/reboot; offered for resume.
+                VRow::Int(i) => {
+                    let s = &snap[i];
+                    let style = if selected { theme::selected_style() } else { theme::warn_style() };
+                    let spans = vec![
+                        Span::styled(" ⚠ interrupted ", theme::warn_style()),
+                        Span::styled(s.display_title(), style),
+                        Span::styled(format!(" {}", s.age(now_ms())), theme::dim_style()),
+                    ];
+                    items.push(ListItem::new(Line::from(spans)));
+                }
+                VRow::Sess(i) => {
+                    let s = &snap[i];
+                    let marker = if s.active { "●" } else { "·" };
+                    let title_style = if selected { theme::selected_style() } else { theme::text_style() };
+                    let meta_style = if selected { Style::default().fg(theme::DIM) } else { theme::dim_style() };
+                    let spans = vec![
+                        Span::styled(format!(" {marker} "), theme::dim_style()),
+                        Span::styled(s.display_title(), title_style),
+                        Span::styled(format!(" {}", s.age(now_ms())), meta_style),
+                    ];
+                    items.push(ListItem::new(Line::from(spans)));
+                }
+            }
         }
         f.render_widget(List::new(items), inner);
+    }
+}
+
+/// Where pinga persists the set of sessions it has opened (so interrupted
+/// sessions can be detected across restarts). ~/.local/state/pinga/opened.json
+fn opened_state_path() -> PathBuf {
+    let base = dirs::state_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/state"));
+    base.join("pinga").join("opened.json")
+}
+
+fn load_opened_state() -> Vec<(usize, String, String)> {
+    std::fs::read_to_string(opened_state_path()).ok()
+        .and_then(|s| serde_json::from_str::<Vec<(usize, String, String)>>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_opened_state(opened: &[(usize, String, String)]) {
+    if let Ok(json) = serde_json::to_string(opened) {
+        let p = opened_state_path();
+        if let Some(parent) = p.parent() { let _ = std::fs::create_dir_all(parent); }
+        let _ = std::fs::write(p, json);
     }
 }
 

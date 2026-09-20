@@ -87,3 +87,20 @@ even with no login session:
 - tmux multi-client confirmed: the same session and the same window render in
   several terminals at once (one pane process, screens fully synced). Type in
   one client at a time per pane.
+## Follow-up (2026-09-19): resurrect save gap + the real survival story
+
+- The "tmux screens are restored by resurrect+continuum" claim was **never
+  backed by a save file** — after the 2026-09-18 power failure, `~/.tmux/resurrect/`
+  was empty, so no layout came back. Continuum only saves after a server has
+  been up > its 15-min interval; a quick power loss kills the server first.
+- Added a **systemd user timer** (`pinga-tmux-save.service` + `.timer`,
+  OnCalendar=`*:0/10`) that snapshots the whole tmux server every 10 min via
+  `tmux run-shell -t <any> ~/.tmux/plugins/tmux-resurrect/scripts/save.sh`.
+  This is independent of tmux uptime. A save file now exists
+  (`~/.tmux/resurrect/last`).
+- Backends that DID survive the reboot (opencode on :4096, codex daemon, both
+  systemd units + `enable-linger`) are the reliable half; tmux layout survival
+  is now handled by the timer + resurrect restore on next tmux start.
+- pinga's "+ new session" (opencode: POST /session; codex: `cd <dir> && codex`)
+  and interrupted-session tracking (state file + startup-only flag) are wired
+  into this persistence story.
