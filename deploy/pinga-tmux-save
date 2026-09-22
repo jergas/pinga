@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Save the tmux layout (via tmux-resurrect) so it survives a reboot/power loss.
+# Runs as a systemd user timer every 10 min INDEPENDENT of how long a tmux
+# server has been up — continuum's 15-min first-save is why a quick power
+# failure could kill tmux before any snapshot existed.
+#
+# If no tmux server is running there is nothing to save; exit quietly.
+if ! command -v tmux >/dev/null 2>&1; then exit 0; fi
+
+if ! tmux ls >/dev/null 2>&1; then
+    exit 0
+fi
+
+SAVE_SCRIPT="$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"
+if [ ! -f "$SAVE_SCRIPT" ]; then
+    exit 0
+fi
+
+# resurrect's save.sh snapshots the WHOLE server (all sessions), so any
+# running session provides the context; pick the first one.
+SESSION="$(tmux ls -F '#{session_name}' 2>/dev/null | head -n1)"
+[ -z "$SESSION" ] && exit 0
+
+tmux run-shell -t "$SESSION" "$SAVE_SCRIPT" >/dev/null 2>&1
+exit 0

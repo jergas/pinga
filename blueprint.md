@@ -329,6 +329,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 unicode-width = "0.1"
+fs2 = "0.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
 ureq = { version = "2", default-features = false, features = ["json"] }
 ```
 
@@ -355,6 +357,8 @@ pub struct Config {
     pub auto_rename: bool,             // auto-suggest names for newer sessions
     pub refresh_secs: u64,
     pub theme: String,                 // "magic" (the purple/green palette)
+    pub list_detail: String,           // "two-line" (default) | "bottom" — codex row layout
+    pub forms: String,                 // "modal" (default) | "inline" — form dialog style
 }
 
 impl Default for Config {
@@ -371,6 +375,8 @@ impl Default for Config {
             auto_rename: false,
             refresh_secs: 5,
             theme: "magic".into(),
+            list_detail: "two-line".into(),
+            forms: "modal".into(),
         }
     }
 }
@@ -428,6 +434,7 @@ pub struct Session {
     pub title: Option<String>,
     pub slug: Option<String>,
     pub directory: Option<String>,
+    pub session_id: Option<String>,   // codex's session (may group several threads)
     pub agent: Option<String>,
     pub model: Option<String>,
     pub created_ms: Option<u64>,
@@ -582,6 +589,7 @@ impl OpencodeProvider {
                 title,
                 slug,
                 directory,
+                session_id: None,
                 agent,
                 model,
                 created_ms,
@@ -637,6 +645,7 @@ impl OpencodeProvider {
             title: v.get("title").and_then(|t| t.as_str()).map(str::to_string),
             slug: v.get("slug").and_then(|t| t.as_str()).map(str::to_string),
             directory: v.get("directory").and_then(|t| t.as_str()).map(str::to_string),
+            session_id: None,
             agent: v.get("agent").and_then(|t| t.as_str()).map(str::to_string),
             model: v.get("model").and_then(|t| t["id"].as_str()).map(str::to_string),
             created_ms: v["time"]["created"].as_u64(),
@@ -677,13 +686,17 @@ impl crate::provider::Provider for OpencodeProvider {
 
 ### 11.6 codex adapter (`prov::codex`)
 
-Reads `session_index.jsonl` (thread names, newest append wins) and scans the
-rollout tree for threads that have no name yet. Renaming is an append to the
-same index file — codex's own contract. `attach_command` prefers the name
-(when one exists) for `codex resume`.
+Thread names/titles, working dir, model and timestamps are read from the
+app-server's **state DB** (`~/.codex/state_*.sqlite` → `threads` table). That is
+where codex 0.155 keeps them — the old `session_index.jsonl` is no longer
+written, so listing is built by scanning the rollout tree (for real,
+non-seed threads) and joining each rollout id against the DB. Renaming writes
+the thread `name` column (what `/status` and the UI show). `attach_command`
+prefers the name for `codex resume`.
 
 ``` {.rust #prov-codex path="src/provider/codex.rs"}
 use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -692,6 +705,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{ProviderKind, Session};
 
+/// Thread metadata as stored in the app-server state DB `threads` table.
+struct ThreadMeta {
+    name: Option<String>,   // short thread name (set via /status or pinga)
+    title: Option<String>,  // longer title / first-prompt preview
+    cwd: Option<String>,
+    model: Option<String>,
+    created_ms: Option<u64>,
+    updated_ms: Option<u64>,
+}
+
+impl ThreadMeta {
+    /// Display name, preferring a short name over the long title.
+    fn display(&self) -> Option<String> {
+        self.name.clone().filter(|n| !n.trim().is_empty())
+            .or_else(|| self.title.clone().filter(|t| !t.trim().is_empty()))
+    }
+}
+
 pub struct CodexProvider { home: PathBuf }
 
 impl CodexProvider {
@@ -699,20 +730,92 @@ impl CodexProvider {
         Self { home: home.to_path_buf() }
     }
 
-    fn index_path(&self) -> PathBuf { self.home.join("session_index.jsonl") }
-
-    fn list(&self) -> Result<Vec<Session>> {
-        let mut names: HashMap<String, (String, Option<u64>)> = HashMap::new();
-        // session_index.jsonl: {"id","thread_name","updated_at"} appended lines
-        if let Ok(raw) = fs::read_to_string(self.index_path()) {
-            for line in raw.lines() {
-                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-                if let (Some(id), Some(name)) = (v["id"].as_str(), v["thread_name"].as_str()) {
-                    let updated = v["updated_at"].as_str().and_then(parse_rfc3339_ms);
-                    names.insert(id.to_string(), (name.to_string(), updated));
+    /// Locate the app-server state DB: `~/.codex/state_*.sqlite` that has a
+    /// `threads` table (the numeric suffix changes between codex releases).
+    fn state_db_path(&self) -> Option<PathBuf> {
+        let dir = self.home.as_path();
+        let mut found: Option<PathBuf> = None;
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("state_") && name.ends_with(".sqlite") {
+                    // only accept if it actually exposes `threads`
+                    if let Ok(conn) = Connection::open(e.path()) {
+                        let has = conn.query_row(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads'",
+                            [], |_| Ok(())).is_ok();
+                        if has { found = Some(e.path()); break; }
+                    }
                 }
             }
         }
+        found
+    }
+
+    /// Load all threads from the state DB into an id -> metadata map.
+    fn thread_meta(&self) -> HashMap<String, ThreadMeta> {
+        let mut map = HashMap::new();
+        let Some(db) = self.state_db_path() else { return map };
+        let Ok(conn) = Connection::open(&db) else { return map };
+        let query = "SELECT id, name, title, cwd, model, created_at_ms, updated_at_ms FROM threads";
+        let Ok(mut stmt) = conn.prepare(query) else { return map };
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let meta = ThreadMeta {
+                name: row.get::<_, Option<String>>(1)?,
+                title: row.get::<_, Option<String>>(2)?,
+                cwd: row.get::<_, Option<String>>(3)?,
+                model: row.get::<_, Option<String>>(4)?,
+                created_ms: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                updated_ms: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+            };
+            Ok((id, meta))
+        });
+        if let Ok(rows) = rows {
+            for r in rows.flatten() { map.insert(r.0, r.1); }
+        }
+        map
+    }
+
+    /// child thread id -> parent thread id, from the app-server's spawn edges.
+    /// Nameless sub-agent threads inherit their parent's name so they don't
+    /// show a bare id (e.g. the sub-thread of "Review Mnemosyne memory").
+    fn parents(&self) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        let Some(db) = self.state_db_path() else { return map };
+        if let Ok(conn) = Connection::open(&db) {
+            let query = "SELECT child_thread_id, parent_thread_id FROM thread_spawn_edges";
+            if let Ok(mut stmt) = conn.prepare(query) {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                }) {
+                    for r in rows.flatten() { map.insert(r.0, r.1); }
+                }
+            }
+        }
+        map
+    }
+
+    /// Walk up the spawn-parent chain to the nearest ancestor that has a
+    /// display name, so a nameless sub-agent shows its parent conversation's
+    /// name instead of a bare id.
+    fn inherited_name(&self, id: &str, meta: &HashMap<String, ThreadMeta>,
+                      parents: &HashMap<String, String>) -> Option<String> {
+        let mut cur = id;
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(cur.to_string()) {
+            let Some(pid) = parents.get(cur) else { break };
+            if let Some(m) = meta.get(pid) {
+                if let Some(n) = m.display() { return Some(n); }
+            }
+            cur = pid;
+        }
+        None
+    }
+
+    fn list(&self) -> Result<Vec<Session>> {
+        let meta = self.thread_meta();
+        let parents = self.parents();
         // rollout tree provides id + fallback timestamps + first-prompt seed
         let mut out: Vec<Session> = Vec::new();
         for rollout in self.rollouts()? {
@@ -721,23 +824,35 @@ impl CodexProvider {
             // thread ends the TUI immediately (observed on eris 2026-09-17).
             if !has_conversation(&rollout) { continue; }
             let id = rollout_title_id(&rollout).unwrap_or_default();
-            let updated = names.get(&id).and_then(|(_, u)| *u)
+            let m = meta.get(&id);
+            // Display name: pinga/codex name, else codex title, else an
+            // inherited parent name for nameless sub-agent threads, else id.
+            let title = m.and_then(|m| m.display())
+                .or_else(|| self.inherited_name(&id, &meta, &parents));
+            let updated = m.and_then(|m| m.updated_ms)
                 .or_else(|| file_mtime_ms(&rollout));
-            let title = names.get(&id).map(|(n, _)| n.clone());
+            let (directory, session_id, model) = rollout_cwd_session_model(&rollout);
             out.push(Session {
                 kind: ProviderKind::Codex,
                 id,
                 title,
                 slug: None,
-                directory: None,
+                directory: m.and_then(|m| m.cwd.clone()).or(directory),
+                session_id,
                 agent: None,
-                model: None,
-                created_ms: None,
+                model: m.and_then(|m| m.model.clone()).or(model),
+                created_ms: m.and_then(|m| m.created_ms),
                 updated_ms: updated,
                 active: false,
             });
         }
-        out.sort_by_key(|s| std::cmp::Reverse(s.updated_ms.unwrap_or(0)));
+        // Most-recent first, with a stable id tiebreak so equal timestamps don't
+        // jitter between refreshes (and renames never move a row, since they no
+        // longer bump updated_at_ms).
+        out.sort_by(|a, b| {
+            b.updated_ms.unwrap_or(0).cmp(&a.updated_ms.unwrap_or(0))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(out)
     }
 
@@ -767,6 +882,23 @@ impl CodexProvider {
     }
 
     fn rename(&self, s: &Session, title: &str) -> Result<()> {
+        // Codex 0.155 keeps the thread name in the app-server state DB `threads`
+        // table — that is what /status and the UI show. Write it there. (The old
+        // session_index.jsonl append is gone in this codex, so nothing reads it.)
+        if let Some(db) = self.state_db_path() {
+            if let Ok(conn) = Connection::open(&db) {
+                // Renaming only sets the label — do NOT bump updated_at_ms, or
+                // the session would jump to the top of the recency sort and the
+                // list would visibly reshuffle on every rename.
+                let n = conn.execute(
+                    "UPDATE threads SET name = ?1 WHERE id = ?2",
+                    params![title, s.id],
+                ).unwrap_or(0);
+                if n > 0 { return Ok(()); }
+            }
+        }
+        // Fallback: thread not (yet) in the state DB — keep an index append so
+        // a name still survives the gap.
         let line = serde_json::json!({
             "id": s.id,
             "thread_name": title,
@@ -774,8 +906,8 @@ impl CodexProvider {
         });
         use std::io::Write;
         let mut f = fs::OpenOptions::new()
-            .create(true).append(true).open(self.index_path())
-            .with_context(|| format!("open {}", self.index_path().display()))?;
+            .create(true).append(true).open(self.home.join("session_index.jsonl"))
+            .with_context(|| "open codex session_index.jsonl")?;
         writeln!(f, "{line}")?;
         Ok(())
     }
@@ -785,45 +917,6 @@ impl CodexProvider {
             Some(name) => format!("codex resume {}", shell_quote(name)),
             None => format!("codex resume {}", s.id),
         }
-    }
-}
-
-fn parse_rfc3339_ms(s: &str) -> Option<u64> {
-    // RFC3339 "2026-09-08T10:39:38.49962476Z" -> epoch millis (best effort, no chrono dep)
-    let t = time_ish::parse(s).ok()?;
-    Some(t.to_ms())
-}
-
-// Minimal RFC3339 -> epoch-ms parser (keeps deps to zero; swap for chrono if it bites).
-mod time_ish {
-    pub struct Instantish(u64);
-    pub fn parse(s: &str) -> Result<Instantish, &'static str> {
-        let (dt, _z) = s.split_once('Z').or_else(|| s.split_once('z')).ok_or("tz")?;
-        let (date, time) = dt.split_once('T').ok_or("t")?;
-        let mut it = date.split('-'); let y: u32 = it.next().ok_or("y")?.parse().ok().ok_or("y")?;
-        let mo: u32 = it.next().ok_or("m")?.parse().map_err(|_| "m")?;
-        let d: u32 = it.next().ok_or("d")?.parse().map_err(|_| "d")?;
-        let mut it = time.split(':');
-        let h: u32 = it.next().ok_or("h")?.parse().map_err(|_| "h")?;
-        let mi: u32 = it.next().ok_or("min")?.parse().map_err(|_| "min")?;
-        let sec_parts: Vec<&str> = it.next().ok_or("s")?.split('.').collect();
-        let s: u32 = sec_parts[0].parse().map_err(|_| "s")?;
-        let ms: u64 = if sec_parts.len() > 1 { format!("{:.0}", sec_parts[1].chars().take(3).collect::<String>().parse::<f64>().unwrap_or(0.0)).parse().unwrap_or(0) }
-                      else { 0 };
-        let days = days_from_civil(y, mo, d);
-        let secs = days as u64 * 86400 + (h as u64 * 3600 + mi as u64 * 60 + s as u64);
-        Ok(Instantish(secs * 1000 + ms))
-    }
-    impl Instantish { pub fn to_ms(&self) -> u64 { self.0 } }
-
-    fn days_from_civil(y: u32, mo: u32, d: u32) -> i64 { /* Howard Hinnant's algorithm */
-        let y = y as i64 - (mo <= 2) as i64;
-        let era = y.div_euclid(400);
-        let yoe = y - era * 400;
-        let mp = (mo + 9) % 12;
-        let doy = (153 * mp as i64 + 2) / 5 + d as i64 - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146097 + doe - 719468
     }
 }
 
@@ -860,9 +953,16 @@ mod chrono_free {
 }
 
 fn rollout_title_id(p: &Path) -> Option<String> {
-    // rollout-2026-09-08T03-58-22-01a08074-….jsonl  -> last dash segment is the thread id
+    // rollout-2026-09-19T23-38-41-01a0bd52-e4d4-7f43-af6f-462ea7e8fa57.jsonl
+    // The thread id is the trailing UUID (8-4-4-4-12). Take the last five
+    // '-' segments (not just the last one — a truncated id wouldn't match the
+    // app-server threads table, so no names would resolve).
     let stem = p.file_stem()?.to_string_lossy();
-    stem.rsplit('-').next().map(str::to_string)
+    let mut segs: Vec<&str> = stem.rsplitn(6, '-').collect();
+    if segs.len() < 5 { return None; }
+    segs.truncate(5);
+    segs.reverse();
+    Some(segs.join("-"))
 }
 
 /// True when the rollout contains something besides the initial session_meta
@@ -876,6 +976,33 @@ fn has_conversation(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Pull the working directory, codex session id, and model from a rollout's
+/// session_meta / payload lines (best effort). `session_id` groups a thread
+/// (and any subagents) under one session; the model surfaces in a later line.
+fn rollout_cwd_session_model(p: &Path) -> (Option<String>, Option<String>, Option<String>) {
+    let mut cwd = None;
+    let mut session_id = None;
+    let mut model = None;
+    if let Ok(raw) = fs::read_to_string(p) {
+        for line in raw.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let payload = &v["payload"];
+            if v["type"] == "session_meta" {
+                if cwd.is_none() { cwd = payload.get("cwd").and_then(|c| c.as_str()).map(str::to_string); }
+                if session_id.is_none() { session_id = payload.get("session_id").and_then(|c| c.as_str()).map(str::to_string); }
+            }
+            if model.is_none() { model = payload.get("model").and_then(|m| m.as_str()).map(str::to_string); }
+            if cwd.is_some() && session_id.is_some() && model.is_some() { break; }
+        }
+    }
+    (cwd, session_id, model)
+}
+
+/// Best-effort display title from a rollout: the first non-injected user
+/// message. Skips system/plugin prompts (which start with `<`, e.g.
+/// `<recommended_plugins>`), collapses whitespace, and caps the length. Returns
+/// None for threads with no real user text (subagent/empty threads), so the
+/// caller falls back to the id.
 fn shell_quote(s: &str) -> String {
     if s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ' ') {
         s.to_string() // needless quoting only when needed
@@ -990,6 +1117,13 @@ pub fn in_tmux() -> bool {
     }
 }
 
+/// Whether the current tmux server forwards mouse events (`tmux show -g mouse`).
+/// pinga can only receive mouse clicks through tmux if its mouse mode is on.
+pub fn tmux_mouse_on() -> Result<bool> {
+    let out = Command::new("tmux").args(["show", "-g", "mouse"]).output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().ends_with("on"))
+}
+
 fn current_tmux_session() -> Result<String> {
     let out = Command::new("tmux").args(["display-message", "-p", "#{S}"]).output()?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -1082,6 +1216,72 @@ pub fn window_runs(win: &str, needles: &[&str]) -> Result<bool> {
         if pid_runs_needles(pid, needles)? { return Ok(true); }
     }
     Ok(false)
+}
+
+/// Scan every pane's process tree in the current tmux session and collect
+/// which opencode session ids and codex thread names are currently attached.
+/// This separates "running" from "closed" sessions, including ones opened by
+/// hand (not just those pinga tracked). A bare `opencode attach <url>` (no `-s`)
+/// binds to the newest session; that's surfaced as the sentinel "__newest__"
+/// for the caller to map.
+pub fn scan_attached() -> Result<(Vec<String>, Vec<String>)> {
+    if !in_tmux() { return Ok((Vec::new(), Vec::new())); }
+    let session = current_tmux_session()?;
+    let out = Command::new("tmux").args(["list-windows", "-t", &session, "-F", "#{pane_pid}"]).output()?;
+    let mut opencode: Vec<String> = Vec::new();
+    let mut codex: Vec<String> = Vec::new();
+    for pid in String::from_utf8_lossy(&out.stdout).lines() {
+        let pid = pid.trim();
+        if pid.is_empty() { continue; }
+        scan_pid_tree(pid, &mut opencode, &mut codex)?;
+    }
+    opencode.sort(); opencode.dedup();
+    codex.sort(); codex.dedup();
+    Ok((opencode, codex))
+}
+
+fn scan_pid_tree(pid: &str, opencode: &mut Vec<String>, codex: &mut Vec<String>) -> Result<()> {
+    let mut stack: Vec<(String, u32)> = vec![(pid.to_string(), 0)];
+    while let Some((p, depth)) = stack.pop() {
+        let out = Command::new("ps").args(["-p", &p, "-o", "args="]).output()?;
+        let args = String::from_utf8_lossy(&out.stdout);
+        if args.contains("opencode") && args.contains("attach") {
+            if let Some(id) = flag_value(&args, "-s") {
+                opencode.push(id.to_string());
+            } else {
+                opencode.push("__newest__".into());
+            }
+        }
+        if args.contains("codex") && args.contains("resume") {
+            if let Some(name) = resume_value(&args) {
+                codex.push(name);
+            }
+        }
+        if depth >= 3 { continue; }
+        let children = Command::new("pgrep").args(["-P", &p]).output()?;
+        for c in String::from_utf8_lossy(&children.stdout).lines() {
+            let c = c.trim().to_string();
+            if !c.is_empty() { stack.push((c, depth + 1)); }
+        }
+    }
+    Ok(())
+}
+
+/// Value after `-s <id>` in an argv line (opencode's session id).
+fn flag_value(args: &str, flag: &str) -> Option<String> {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    let i = toks.iter().position(|t| *t == flag)?;
+    toks.get(i + 1)
+        .filter(|t| !t.starts_with('-'))
+        .map(|s| s.to_string())
+}
+
+/// The resume name in `codex resume <name>` (the non-flag tokens after it).
+fn resume_value(args: &str) -> Option<String> {
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    let i = toks.iter().position(|t| *t == "resume")?;
+    let name: Vec<&str> = toks[i + 1..].iter().copied().filter(|t| !t.starts_with('-')).collect();
+    if name.is_empty() { None } else { Some(name.join(" ")) }
 }
 
 /// Does `pid` (or any descendant, bounded) have every `needle` in its argv?
@@ -1194,7 +1394,7 @@ use crate::provider::{AnyProvider, Provider};
 
 use super::theme;
 
-const HELP: &str = "↑↓ select · ←→ column · click select · dbl-click/Enter open · Enter on '+' new · r rename · s suggest · m mouse · o auto · f force · q quit";
+const HELP: &str = "↑↓ select · ←→ column · click select · dbl-click/Enter open · Enter on '+' new · r rename · s suggest · i info · g refresh · d detail · m mouse · o auto · f force · q quit";
 pub const QUIT_MSG: &str = "quit";
 
 /// D8: two clicks on the same cell within this window count as one open.
@@ -1216,7 +1416,7 @@ enum Plan {
 /// One row of a column's visual list, in display order: the fixed "+ new
 /// session" row, then any interrupted (orphaned) sessions, then the rest.
 #[derive(Debug, Clone, Copy)]
-enum VRow { New, Int(usize), Sess(usize) }
+enum VRow { New, Int(usize), Sess(usize), Header(&'static str) }
 
 /// The bottom-line editor modes. Rename edits one title; NewSession is a
 /// two-field form (name then working directory) for the "+ new session" row.
@@ -1239,12 +1439,15 @@ pub struct App {
     error: Option<String>,
     opened: Vec<(usize, String, String)>,   // (provider, session id, tmux window id) — D8
     interrupted: [Vec<String>; 2],  // ids in each column orphaned by a crash (window dead)
+    running: [Vec<String>; 2],  // ids in each column currently attached in a live window
+    detail: bool,   // true = two-line rows (default), false = "bottom" (id only for selected)
     last_click: Option<(Instant, usize, usize)>,  // (time, column, row) — D8 double-click
     force_open: bool,         // 'f' bypasses the D8 "already open elsewhere" refusal
     pending: Option<Plan>,    // D8: deferred mouse open (executed on mouse Up)
     mouse_ignore_until: Option<Instant>,  // D8: swallow stray downs after a switch
     needs_clear: bool,     // after a bare-terminal suspend, force a full repaint
     did_startup_reconcile: bool,  // interrupted-flagging runs once, at startup
+    info: Option<Session>,  // Some(s) => the 'i' detail modal is open for s
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1294,6 +1497,7 @@ impl App {
             AnyProvider::Opencode(crate::provider::opencode::OpencodeProvider::new(&cfg.opencode_url)),
             AnyProvider::Codex(crate::provider::codex::CodexProvider::new(&cfg.codex_home)),
         ];
+        let detail = cfg.list_detail.as_str() != "bottom";
         Self {
             cfg,
             providers,
@@ -1303,17 +1507,20 @@ focus: 0,
             sel: [0, 0],
             naming: NameEngine::new(base, key, model),
             edited: None,
-            mouse_on: false,
+            mouse_on: Self::default_mouse(),
             last_poll: Instant::now(),
             error: None,
-            opened: load_opened_state(),
+            opened: read_opened(),
             interrupted: [Vec::new(), Vec::new()],
+            running: [Vec::new(), Vec::new()],
+            detail,
             last_click: None,
             force_open: false,
             pending: None,
             mouse_ignore_until: None,
             needs_clear: false,
             did_startup_reconcile: false,
+            info: None,
         }
     }
 
@@ -1338,7 +1545,45 @@ focus: 0,
             Err(e) => self.error = Some(e.to_string()),
         }
         self.compute_interrupted();
+        self.compute_running();
+        // Selection is in selectable space (headers excluded); just keep it in
+        // range as group membership may have changed.
+        self.sel[self.focus] = self.sel[self.focus].min(self.list_len(self.focus).saturating_sub(1));
         self.last_poll = Instant::now();
+    }
+
+    /// Which sessions are currently attached in a live window (per column) —
+    /// the "running" group. Combines sessions pinga tracks in `opened` (still
+    /// alive + not interrupted) with hand-opened sessions found by scanning the
+    /// tmux panes, so sessions opened outside pinga still group as running.
+    fn compute_running(&mut self) {
+        let mut running: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+        for (p, id, win) in &self.opened {
+            let alive = launcher::tmux_window_alive(win).unwrap_or(false);
+            if alive && self.interrupted[*p].iter().all(|i| i != id) {
+                running[*p].push(id.clone());
+            }
+        }
+        if let Ok((oc, cx)) = launcher::scan_attached() {
+            for id in oc {
+                if id == "__newest__" {
+                    if let Some(n) = self.opencode.iter().max_by_key(|s| s.updated_ms.unwrap_or(0)) {
+                        running[0].push(n.id.clone());
+                    }
+                } else {
+                    running[0].push(id);
+                }
+            }
+            for name in cx {
+                // codex panes carry the resume NAME; map back to a session id.
+                match self.codex.iter().find(|s| s.title.as_deref() == Some(&name)) {
+                    Some(s) => running[1].push(s.id.clone()),
+                    None => running[1].push(name),
+                }
+            }
+        }
+        for r in running.iter_mut() { r.sort(); r.dedup(); }
+        self.running = running;
     }
 
     /// Reconcile the persisted "opened" list against the servers. For each
@@ -1358,48 +1603,52 @@ focus: 0,
         self.did_startup_reconcile = true;
         let mut interrupted: [Vec<String>; 2] = [Vec::new(), Vec::new()];
         let mut gone = 0usize;
-        let mut kept: Vec<(usize, String, String)> = Vec::new();
-        let mut changed = false;
-        // Snapshot which session ids exist on each server before draining the
-        // tracked list, so the immutable read doesn't clash with the mutable
-        // move below.
+        // Snapshot which session ids exist on each server before the closure,
+        // so the immutable read doesn't clash with the mutable registry below.
         let server_ids: Vec<Vec<String>> = self.snapshots().iter()
             .map(|v| v.iter().map(|s| s.id.clone()).collect())
             .collect();
-        for (p, id, win) in std::mem::take(&mut self.opened) {
-            let exists = server_ids[p].contains(&id);
-            if !exists {
-                // Session vanished server-side (deleted/expired). Drop tracking.
-                gone += 1;
-                changed = true;
-                continue;
-            }
-            let alive = launcher::tmux_window_alive(&win).unwrap_or(false);
-            if !alive {
-                if first {
-                    // Window gone while pinga wasn't running — orphaned by a
-                    // crash/reboot. Offer it for resume.
-                    interrupted[p].push(id.clone());
-                    kept.push((p, id, win));
-                } else {
-                    // pinga is live and the window is gone: the user closed it.
+        // Reconcile the SHARED registry cooperatively: the closure runs under
+        // the shared lock against whatever is on disk right now, so concurrent
+        // pinga instances merge instead of clobbering each other.
+        let reconciled = update_opened(|o| {
+            let mut changed = false;
+            let mut kept: Vec<(usize, String, String)> = Vec::with_capacity(o.len());
+            for (p, id, win) in std::mem::take(o) {
+                if !server_ids[p].contains(&id) {
+                    // Session vanished server-side (deleted/expired).
+                    gone += 1;
                     changed = true;
+                    continue;
                 }
-                continue;
+                let alive = launcher::tmux_window_alive(&win).unwrap_or(false);
+                if !alive {
+                    if first {
+                        // Window gone while pinga wasn't running — orphaned by a
+                        // crash/reboot. Offer it for resume.
+                        interrupted[p].push(id.clone());
+                        kept.push((p, id, win));
+                    } else {
+                        // pinga is live and the window is gone: the user closed it.
+                        changed = true;
+                    }
+                    continue;
+                }
+                // Window alive: is the session still attached in it, or did the
+                // user close it (e.g. /exit leaves the pane as a shell)?
+                let marker = self.session_marker(p, &id);
+                let running = launcher::window_runs(&win, &[marker.as_str()]).unwrap_or(false);
+                if running {
+                    kept.push((p, id, win));   // still open — keep tracking
+                } else {
+                    changed = true;            // closed by the user — stop tracking
+                }
             }
-            // Window alive: is the session still attached in it, or did the
-            // user close it (e.g. /exit leaves the pane as a shell)?
-            let marker = self.session_marker(p, &id);
-            let running = launcher::window_runs(&win, &[marker.as_str()]).unwrap_or(false);
-            if running {
-                kept.push((p, id, win));   // still open — keep tracking
-            } else {
-                changed = true;            // closed by the user — stop tracking
-            }
-        }
-        self.opened = kept;
+            *o = kept;
+            changed
+        });
+        self.opened = reconciled;
         self.interrupted = interrupted;
-        if changed { save_opened_state(&self.opened); }
         if gone > 0 {
             self.error = Some(format!(
                 "{gone} session(s) pinga had open no longer exist on the server — removed from tracking"
@@ -1418,32 +1667,85 @@ focus: 0,
 
     fn snapshots(&self) -> [&Vec<Session>; 2] { [&self.opencode, &self.codex] }
 
-    /// Visual row count for a column: the sessions plus the fixed "+ new
-    /// session" row at index 0.
-    /// Visual rows for a column, in display order: the fixed "+ new session" row,
-    /// then interrupted (orphaned) sessions, then the remaining sessions.
+    /// Visual rows for a column, in display order: the fixed "+ new session"
+    /// row, then group subheaders with their sessions: interrupted, running,
+    /// closed. Headers are non-selectable.
     fn visual_rows(&self, idx: usize) -> Vec<VRow> {
         let snap = &self.snapshots()[idx];
-        let mut v = Vec::with_capacity(snap.len() + 1);
-        v.push(VRow::New);
+        let mut ints = Vec::new();
+        let mut runs = Vec::new();
+        let mut closed = Vec::new();
         for (i, s) in snap.iter().enumerate() {
-            if self.interrupted[idx].iter().any(|id| id == &s.id) { v.push(VRow::Int(i)); }
+            if self.interrupted[idx].iter().any(|id| id == &s.id) {
+                ints.push(i);
+            } else if self.running[idx].iter().any(|id| id == &s.id) {
+                runs.push(i);
+            } else {
+                closed.push(i);
+            }
         }
-        for (i, s) in snap.iter().enumerate() {
-            if !self.interrupted[idx].iter().any(|id| id == &s.id) { v.push(VRow::Sess(i)); }
+        let mut v = Vec::with_capacity(snap.len() + 1 + 3);
+        v.push(VRow::New);
+        if !ints.is_empty() {
+            v.push(VRow::Header(" interrupted"));
+            v.extend(ints.into_iter().map(VRow::Int));
+        }
+        if !runs.is_empty() {
+            v.push(VRow::Header(" running"));
+            v.extend(runs.into_iter().map(VRow::Sess));
+        }
+        if !closed.is_empty() {
+            v.push(VRow::Header(" closed"));
+            v.extend(closed.into_iter().map(VRow::Sess));
         }
         v
     }
 
-    /// Number of visual rows (used for selection clamping / scroll bounds).
-    fn list_len(&self, idx: usize) -> usize { self.visual_rows(idx).len() }
+    /// Number of selectable rows for a column (New + every session). Headers are
+    /// not counted; navigation skips them.
+    fn list_len(&self, idx: usize) -> usize { self.snapshots()[idx].len() + 1 }
 
-    /// The focused row is the "+ new session" element (visual row 0).
+    /// Session indices in display (selectable) order: interrupted, then
+    /// running, then closed. `sel` is an index into this space (0 = "+ new
+    /// session", k >= 1 = the (k-1)th entry here), so it stays consistent
+    /// between navigation, rendering and the rename target.
+    fn selectable_sessions(&self, idx: usize) -> Vec<usize> {
+        let snap = &self.snapshots()[idx];
+        let mut order = Vec::with_capacity(snap.len());
+        for group in [&self.interrupted[idx], &self.running[idx]] {
+            for (i, s) in snap.iter().enumerate() {
+                if group.iter().any(|id| id == &s.id) { order.push(i); }
+            }
+        }
+        for (i, s) in snap.iter().enumerate() {
+            if !self.interrupted[idx].iter().any(|id| id == &s.id)
+                && !self.running[idx].iter().any(|id| id == &s.id) {
+                order.push(i);
+            }
+        }
+        order
+    }
+
+    /// Move the selection by `delta` in SELECTABLE space (headers aren't part
+    /// of it), so it never lands on a group header.
+    fn move_cursor(&mut self, delta: i32) {
+        let idx = self.focus;
+        let n = self.list_len(idx);
+        if n == 0 { self.sel[idx] = 0; return; }
+        let max = n - 1;
+        self.sel[idx] = (self.sel[idx] as i64 + delta as i64).clamp(0, max as i64) as usize;
+    }
+
+    /// The focused row is the "+ new session" element (selectable row 0).
     fn on_new_row(&self) -> bool { self.sel[self.focus] == 0 }
 
     /// Run the event loop; returns when the user quits.
     pub fn run(&mut self, term: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
         self.refresh();
+        // Apply the mouse default (on when a mouse looks available) once.
+        if self.mouse_on {
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+        }
         loop {
             let timeout = Duration::from_millis(self.cfg.refresh_secs.saturating_mul(1000) / 4);
             match event::poll(timeout)? {
@@ -1476,6 +1778,11 @@ focus: 0,
             self.execute(plan)?;
         }
         self.error = None;   // any key dismisses a status line
+        // The 'i' info modal captures keys until dismissed.
+        if self.info.is_some() {
+            if matches!(code, Esc | Char('q')) { self.info = None; }
+            return Ok(());
+        }
         if self.edited.is_some() {
             return self.handle_edit_key(code);
         }
@@ -1486,19 +1793,22 @@ focus: 0,
             Char('m') => return self.toggle_mouse(),
             Char('s') => return self.suggest_current(false),
             Char('f') => return self.open_selected_force(),  // D8: bypass refusal
+            Char('g') => { self.refresh(); return Ok(()); }  // manual refresh
+            Char('i') => {
+                if let Some(s) = self.focused_session().cloned() { self.info = Some(s); }
+                return Ok(());
+            }
             _ => {}
         }
         // Pure state mutations; trailing Ok keeps the match unit-typed.
         match code {
-            Up => self.sel[self.focus] = self.sel[self.focus].saturating_sub(1),
-Down => {
-                let n = self.snapshots()[self.focus].len();   // last session row
-                self.sel[self.focus] = (self.sel[self.focus] + 1).min(n);
-            }
+            Up => self.move_cursor(-1),
+            Down => self.move_cursor(1),
             Left | Char('h') if self.focus > 0 => self.focus -= 1,
             Right | Char('l') if self.focus < 1 => self.focus += 1,
             Char('r') => self.start_rename(),
             Char('o') => self.cfg.auto_rename = !self.cfg.auto_rename,
+            Char('d') => self.detail = !self.detail,   // two-line <-> bottom
             _ => {}
         }
         Ok(())
@@ -1512,6 +1822,19 @@ Down => {
             crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
         }
         Ok(())
+    }
+
+    /// Default for mouse capture at startup. Enable it when a mouse looks
+    /// usable: in tmux only if tmux forwards mouse events (its mouse mode is
+    /// on); standalone, modern terminals report mouse via escape sequences, so
+    /// default on. Turning it on when there's no mouse is harmless (no events
+    /// arrive) and 'm' still toggles.
+    fn default_mouse() -> bool {
+        if launcher::in_tmux() {
+            launcher::tmux_mouse_on().unwrap_or(true)
+        } else {
+            true
+        }
     }
 
     fn handle_edit_key(&mut self, code: KeyCode) -> anyhow::Result<()> {
@@ -1572,10 +1895,25 @@ Down => {
     }
 
     fn focused_session(&self) -> Option<&Session> {
-        match self.visual_rows(self.focus).get(self.sel[self.focus]) {
-            Some(VRow::Int(i)) | Some(VRow::Sess(i)) => self.snapshots()[self.focus].get(*i),
-            _ => None,
+        let sel = self.sel[self.focus];
+        if sel == 0 { return None; }
+        self.selectable_sessions(self.focus)
+            .get(sel - 1)
+            .and_then(|&i| self.snapshots()[self.focus].get(i))
+    }
+
+    /// Convert a VISUAL row (as hit from the screen, may include a header) into
+    /// a selectable index. Returns None when the row is a header (not clickable)
+    /// or out of range.
+    fn sel_from_visual(&self, idx: usize, vrow: usize) -> Option<usize> {
+        let rows = self.visual_rows(idx);
+        if vrow >= rows.len() || matches!(rows[vrow], VRow::Header(_)) { return None; }
+        let mut sel = 0usize;
+        for (i, row) in rows.iter().enumerate() {
+            if i == vrow { return Some(sel); }
+            if !matches!(row, VRow::Header(_)) { sel += 1; }
         }
+        None
     }
 
     fn open_selected(&mut self, from_mouse: bool) -> anyhow::Result<()> {
@@ -1623,8 +1961,11 @@ Down => {
     fn spawn_new(&mut self, label: &str, cmd: &str, id: &str) -> anyhow::Result<()> {
         if launcher::in_tmux() {
             let win = launcher::open_in_tmux_returning(label, cmd)?;
-            self.opened.push((self.focus, id.to_string(), win));
-            save_opened_state(&self.opened);
+            self.opened = update_opened(|o| {
+                o.retain(|(p, i, _)| !(*p == self.focus && *i == id));
+                o.push((self.focus, id.to_string(), win));
+                true
+            });
             self.mouse_ignore_until = Some(Instant::now() + SWITCH_COOLDOWN);
         } else {
             self.suspend_for(cmd)?;
@@ -1740,15 +2081,22 @@ Down => {
                 launcher::tmux_select_window(&win)?;       // take me to it
             }
             Plan::Adopt { win, id } => {
-                self.opened.push((self.focus, id, win.clone()));
+                self.opened = update_opened(|o| {
+                    o.retain(|(p, i, _)| !(*p == self.focus && *i == id));
+                    o.push((self.focus, id, win.clone()));
+                    true
+                });
                 launcher::tmux_select_window(&win)?;       // same session, not ours
             }
             Plan::Spawn { label, cmd, id } => {
                 let win = launcher::open_in_tmux_returning(&label, &cmd)?;
-                self.opened.push((self.focus, id, win));
+                self.opened = update_opened(|o| {
+                    o.retain(|(p, i, _)| !(*p == self.focus && *i == id));
+                    o.push((self.focus, id, win));
+                    true
+                });
             }
         }
-        save_opened_state(&self.opened);
         // Any window layout change after a mouse open can leak a stray press;
         // swallow down events for a beat so pinga doesn't act on it on return.
         self.mouse_ignore_until = Some(Instant::now() + SWITCH_COOLDOWN);
@@ -1810,11 +2158,10 @@ Down => {
         let (col, row) = hit_rect(m.column, m.row, left, right);
         match m.kind {
             MouseEventKind::ScrollDown => {
-                let n = self.snapshots()[self.focus].len();
-                self.sel[self.focus] = (self.sel[self.focus] + 1).min(n);
+                self.move_cursor(1);
             }
             MouseEventKind::ScrollUp => {
-                self.sel[self.focus] = self.sel[self.focus].saturating_sub(1);
+                self.move_cursor(-1);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 // A stray down right after a window switch is not a conscious
@@ -1828,15 +2175,17 @@ Down => {
                 }
                 self.error = None;   // any explicit click dismisses a status line
                 if let (Some(c), Some(r)) = (col, row) {
-                    if r <= self.snapshots()[c].len() {
+                    // `r` is a visual row (may be a header); map it to a
+                    // selectable index so clicks match keyboard selection.
+                    if let Some(new_sel) = self.sel_from_visual(c, r) {
                         self.focus = c;
-                        self.sel[c] = r;
+                        self.sel[c] = new_sel;
                         // D8: single click selects only; a quick second click
                         // on the same cell opens (double-click pattern).
                         let is_double = self.last_click
-                            .filter(|(t, pc, pr)| t.elapsed() < DOUBLE_MS && *pc == c && *pr == r)
+                            .filter(|(t, pc, pr)| t.elapsed() < DOUBLE_MS && *pc == c && *pr == new_sel)
                             .is_some();
-                        self.last_click = Some((Instant::now(), c, r));
+                        self.last_click = Some((Instant::now(), c, new_sel));
                         if is_double {
                             return self.open_selected(true);
                         }
@@ -1880,7 +2229,11 @@ Down => {
         self.render_column(f, left, 0);
         self.render_column(f, right, 1);
 
-        if let Some(edit) = &self.edited {
+        // Modal forms take over the centre when configured; otherwise forms and
+        // status live on the bottom line.
+        if self.cfg.forms == "modal" && self.edited.is_some() {
+            self.render_edit_modal(f);
+        } else if let Some(edit) = &self.edited {
             let line = match edit {
                 EditState::Rename(e) => self.rename_line(e, area.width),
                 EditState::NewSession { name, cwd, field } => self.new_session_line(name, cwd, *field, area.width),
@@ -1890,7 +2243,102 @@ Down => {
         } else if let Some(e) = &self.error {
             let line = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
             f.render_widget(Paragraph::new(Self::fit(e, usize::from(area.width))).style(theme::warn_style()), line);
+        } else if !self.detail {
+            // "bottom" list mode: show the selected session's id here.
+            if let Some(s) = self.focused_session() {
+                let line = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+                let text = format!(" {} · {}", s.display_title(), s.id);
+                f.render_widget(
+                    Paragraph::new(Self::fit(&text, usize::from(area.width))).style(theme::surface_style()),
+                    line,
+                );
+            }
         }
+
+        // The 'i' info modal renders last so it sits on top.
+        if let Some(s) = &self.info {
+            self.render_info_modal(f, s);
+        }
+    }
+
+    /// Draw a centred, bordered modal box and return its inner area.
+    fn modal_box(&self, f: &mut Frame, title: &str, lines: Vec<Line>) {
+        let area = f.area();
+        let width = area.width.saturating_sub(8).min(64);
+        let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let y = area.y + area.height.saturating_sub(height) / 2;
+        let rect = Rect::new(x, y, width, height);
+        f.render_widget(ratatui::widgets::Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(title, theme::focus_style()))
+            .border_style(theme::focus_style());
+        f.render_widget(&block, rect);
+        f.render_widget(Paragraph::new(lines).style(theme::surface_style()), block.inner(rect));
+    }
+
+    /// Centred modal editor (rename or the "+ new session" two-field form).
+    fn render_edit_modal(&self, f: &mut Frame) {
+        let cursor_style = Style::default().bg(theme::FG).fg(theme::BG);
+        let field_line = |e: &TextEdit, prefix: String| -> Line {
+            let text = e.text();
+            let cursor = e.cursor();
+            let before: String = text.chars().take(cursor).collect();
+            let full_after: String = text.chars().skip(cursor).collect();
+            let after = Self::fit(&full_after, 40);
+            Line::from(vec![
+                Span::styled(prefix, theme::codex_accent()),
+                Span::styled(before, theme::text_style()),
+                Span::styled("▌", cursor_style),
+                Span::styled(after, theme::dim_style()),
+            ])
+        };
+        match &self.edited {
+            Some(EditState::Rename(e)) => {
+                self.modal_box(f, " rename ", vec![
+                    field_line(e, " name: ".to_string()),
+                    Line::from(Span::styled(" [Enter apply · Esc cancel]", theme::dim_style())),
+                ]);
+            }
+            Some(EditState::NewSession { name, cwd, field }) => {
+                let name_mark = if *field == 0 { "▸" } else { " " };
+                let cwd_mark = if *field == 1 { "▸" } else { " " };
+                self.modal_box(f, " new session ", vec![
+                    field_line(name, format!("{name_mark} name: ")),
+                    field_line(cwd, format!("{cwd_mark} cwd: ")),
+                    Line::from(Span::styled(" [Tab field · Enter next/create · Esc cancel]", theme::dim_style())),
+                ]);
+            }
+            None => {}
+        }
+    }
+
+    /// The 'i' modal: every known field of the focused session.
+    fn render_info_modal(&self, f: &mut Frame, s: &Session) {
+        let rows: Vec<(&str, Option<&str>)> = vec![
+            ("id", Some(&s.id)),
+            ("session id", s.session_id.as_deref()),
+            ("thread", s.title.as_deref()),
+            ("slug", s.slug.as_deref()),
+            ("directory", s.directory.as_deref()),
+            ("model", s.model.as_deref()),
+            ("agent", s.agent.as_deref()),
+        ];
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(s.display_title().to_string(), theme::focus_style()),
+            Span::styled(format!("  {}", s.age(now_ms())), theme::dim_style()),
+        ]));
+        for (k, v) in rows {
+            let val = v.unwrap_or("—");
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {k}: "), theme::dim_style()),
+                Span::styled(Self::fit(val, 52), theme::text_style()),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(" [Esc close]", theme::dim_style())));
+        self.modal_box(f, " info ", lines);
     }
 
     /// Bottom-line for the rename editor: keep the cursor block and the
@@ -1968,39 +2416,61 @@ Down => {
         f.render_widget(&block, area);
 
         let mut items: Vec<ListItem> = Vec::new();
-        for (visual, row) in self.visual_rows(idx).into_iter().enumerate() {
-            let selected = visual == self.sel[idx];
+        let mut sel_row = 0usize;                 // selectable rows (New + sessions)
+        let mut sel_item_index: Option<usize> = None;  // item index to scroll to
+        for row in self.visual_rows(idx) {
             match row {
+                VRow::Header(label) => {
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        format!(" {} ", label), theme::dim_style(),
+                    ))));
+                }
                 VRow::New => {
+                    let selected = sel_row == self.sel[idx];
                     let style = if selected { theme::selected_style() } else { theme::codex_accent() };
                     items.push(ListItem::new(Line::from(Span::styled(" + new session", style))));
+                    if selected { sel_item_index = Some(items.len() - 1); }
+                    sel_row += 1;
                 }
-                // Interrupted = orphaned by a crash/reboot; offered for resume.
                 VRow::Int(i) => {
-                    let s = &snap[i];
-                    let style = if selected { theme::selected_style() } else { theme::warn_style() };
-                    let spans = vec![
-                        Span::styled(" ⚠ interrupted ", theme::warn_style()),
-                        Span::styled(s.display_title(), style),
-                        Span::styled(format!(" {}", s.age(now_ms())), theme::dim_style()),
-                    ];
-                    items.push(ListItem::new(Line::from(spans)));
+                    let selected = sel_row == self.sel[idx];
+                    items.push(self.session_item(&snap[i], true, selected));
+                    if selected { sel_item_index = Some(items.len() - 1); }
+                    sel_row += 1;
                 }
                 VRow::Sess(i) => {
-                    let s = &snap[i];
-                    let marker = if s.active { "●" } else { "·" };
-                    let title_style = if selected { theme::selected_style() } else { theme::text_style() };
-                    let meta_style = if selected { Style::default().fg(theme::DIM) } else { theme::dim_style() };
-                    let spans = vec![
-                        Span::styled(format!(" {marker} "), theme::dim_style()),
-                        Span::styled(s.display_title(), title_style),
-                        Span::styled(format!(" {}", s.age(now_ms())), meta_style),
-                    ];
-                    items.push(ListItem::new(Line::from(spans)));
+                    let selected = sel_row == self.sel[idx];
+                    items.push(self.session_item(&snap[i], false, selected));
+                    if selected { sel_item_index = Some(items.len() - 1); }
+                    sel_row += 1;
                 }
             }
         }
-        f.render_widget(List::new(items), inner);
+        // ratatui 0.29 ListState drives selection + auto-scroll to it.
+        let mut state = ratatui::widgets::ListState::default();
+        if let Some(si) = sel_item_index { state.select(Some(si)); }
+        f.render_stateful_widget(List::new(items), inner, &mut state);
+    }
+
+    /// One session's ListItem. `interrupted` picks the warn marker/title. When
+    /// `self.detail` (two-line) is on, a dim second line carries the session id;
+    /// the selected item is styled (and scrolled to) by the caller via List.
+    fn session_item<'a>(&self, s: &'a Session, interrupted: bool, selected: bool) -> ListItem<'a> {
+        let marker = if interrupted { "⚠ " } else { "· " };
+        let title_fg = if interrupted { theme::WARN } else { theme::FG };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(format!(" {marker}"), Style::default().fg(theme::DIM)),
+            Span::styled(s.display_title(), Style::default().fg(title_fg)),
+            Span::styled(format!(" {}", s.age(now_ms())), Style::default().fg(theme::DIM)),
+        ])];
+        if self.detail {
+            lines.push(Line::from(Span::styled(
+                format!("   {}", s.id), Style::default().fg(theme::DIM),
+            )));
+        }
+        let mut item = ListItem::new(lines);
+        if selected { item = item.style(theme::selected_style()); }
+        item
     }
 }
 
@@ -2012,18 +2482,54 @@ fn opened_state_path() -> PathBuf {
     base.join("pinga").join("opened.json")
 }
 
-fn load_opened_state() -> Vec<(usize, String, String)> {
+/// The lock file guarding the shared registry (see update_opened).
+fn opened_lock_path() -> PathBuf {
+    opened_state_path().with_extension("lock")
+}
+
+/// Read the CURRENT on-disk registry. Because writers rename atomically,
+/// a reader always sees a complete file (never a torn write).
+fn read_opened() -> Vec<(usize, String, String)> {
     std::fs::read_to_string(opened_state_path()).ok()
         .and_then(|s| serde_json::from_str::<Vec<(usize, String, String)>>(&s).ok())
         .unwrap_or_default()
 }
 
-fn save_opened_state(opened: &[(usize, String, String)]) {
+/// Atomically replace the registry (write a temp, then rename over the real
+/// path). No locking here — callers that mutate must go through update_opened.
+fn write_opened_atomic(opened: &[(usize, String, String)]) {
     if let Ok(json) = serde_json::to_string(opened) {
         let p = opened_state_path();
         if let Some(parent) = p.parent() { let _ = std::fs::create_dir_all(parent); }
-        let _ = std::fs::write(p, json);
+        let tmp = p.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
+        }
     }
+}
+
+/// Cooperative mutation of the SHARED registry. All pinga instances go through
+/// this: take an exclusive advisory lock on the lock file, read the current
+/// on-disk list, apply `f` (which returns true if it changed anything), write
+/// back atomically, release the lock, and return the merged result. Because
+/// every instance reads+merges the same file under the same lock, concurrent
+/// instances converge instead of clobbering each other — "state follows me".
+fn update_opened(f: impl FnOnce(&mut Vec<(usize, String, String)>) -> bool) -> Vec<(usize, String, String)> {
+    let lock_path = opened_lock_path();
+    if let Some(parent) = lock_path.parent() { let _ = std::fs::create_dir_all(parent); }
+    let _guard = match std::fs::OpenOptions::new()
+        .create(true).read(true).write(true).truncate(false)
+        .open(&lock_path) {
+        Ok(file) => {
+            let _ = fs2::FileExt::lock_exclusive(&file);
+            Some(file)   // held until the end of this function keeps the lock
+        }
+        Err(_) => None,
+    };
+    let mut opened = read_opened();
+    let changed = f(&mut opened);
+    if changed { write_opened_atomic(&opened); }
+    opened
 }
 
 /// The area below the one-line header.

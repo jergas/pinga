@@ -35,3 +35,45 @@
 - STEP 1 — created tmux session `pinga` with ONE window running the installed `pinga` (pinga opens all other sessions as windows).
 - STEP 2 — reboot survival: found `~/.tmux/resurrect/` had NO save file (why the 2026-09-18 power failure lost the layout). Added systemd user service+timer `pinga-tmux-save` (OnCalendar=`*:0/10`) calling resurrect `save.sh` via `tmux run-shell`; verified it writes a snapshot. Timer enabled; next run 23:30.
 - STEP 3 — documented the reality in ADR-0002 + gotchas (resurrect save gap, codex daemon socket, interrupted-session startup-only flag).
+
+## [2026-09-20] PLAN | cooperative concurrency + grouping + modals + keys + installer
+- A. opened.json is now a SHARED cooperative registry: every write is atomic (tmp+rename) and guarded by an flock (`fs2`); all mutations go through `update_opened(closure)` (lock -> read -> apply -> write -> return). Every instance reloads the registry at the top of each refresh, so concurrent instances converge ("state follows me"). Verified: instance 2 shows instance 1's opened session under "running".
+- B. Columns now group sessions under subheaders: `+ new session` / `interrupted` / `running` / `closed`. `running` = alive window (from opened) + hand-opened via a new `launcher::scan_attached()` argv walk. Selection (move_cursor) skips headers; ListState drives scroll-to-selection.
+- C. Two-line rows by default (title+age / dim id); config `list_detail="two-line"|"bottom"` + runtime `d` toggle (bottom shows the selected id on the status line). codex provider now parses `cwd`, `model`, and `session_id` from the rollout (session_meta) so detail is complete.
+- D. Rename + new-session forms are centred modal dialogs by default (config `forms="modal"|"inline"`); the `i` key opens a full-info modal (id, session id, thread, slug, directory, model, agent).
+- E. Keys: `g` manual refresh, `d` toggle detail, `i` info.
+- F. Installer: vendored `deploy/pinga-tmux-save.{sh,service,timer}`; `make install` deploys pinga + the timer and `systemctl --user enable --now`s it (non-fatal if no systemd user session); `make uninstall` removes them.
+- Verified in a throwaway tmux harness: grouping, two-line/bottom toggle, info modal, modal form, concurrency, `g`.
+
+## [2026-09-22] FIX | codex thread names + id parsing
+- Root cause: codex 0.155 no longer writes `~/.codex/sessions/session_index.jsonl` (which pinga read for names) — names now live in the app-server state DB `~/.codex/state_*.sqlite` → `threads` table (`name`/`title` columns).
+- ALSO a parsing bug: `rollout_title_id` returned only the LAST 12 chars of the thread UUID, so codex ids looked "shortened" and never matched the threads table (full UUID) — hence no names resolved.
+- Fix: codex provider now reads `state_*.sqlite` (found by glob + `threads` table check) via `rusqlite` (bundled) and joins rollout ids (now full trailing UUID) to it. Display name order: `name` -> `title` -> id. Also pulls cwd/model/created/updated from the DB.
+- pinga's codex rename now UPDATEs the threads `name` column (so pinga-set names are the thread name /status shows), falling back to a session_index.jsonl append if the thread isn't in the DB yet.
+- New dep: rusqlite 0.31 (bundled). Verified: open session now shows "Review Mnemosyne memory"; `i` modal shows id, session id, thread, directory, model.
+
+## [2026-09-22] codex display fallback refined
+- Display order confirmed: pinga/codex thread `name` -> codex `title` -> id.
+- Tried deriving a title from the rollout's first user message for nameless+titleless threads, but it picked up injected system prompts (AGENTS.md, <recommended_plugins>) as misleading titles — reverted. When the DB has neither name nor title the thread genuinely has none (mostly subagent/automated threads), so the id is the honest fallback.
+- IMPORTANT: user must RESTART pinga to pick up the codex-name fix — a running old binary still shows truncated ids and puts the id in the rename dialogue. Renaming is safe: it only writes the threads.name label, never the conversation.
+
+## [2026-09-22] codex sub-thread name inheritance
+- User's open session showed an id in the list + rename dialogue. Root cause: it was thread 01a0c060, a NAMELESS sub-agent of 01a0bc60 ("Review Mnemosyne memory") — codex names live per-thread, and that thread has none of its own.
+- Fix: codex provider reads `thread_spawn_edges` (child->parent) from state_5.sqlite and, for a thread with no name/title, walks up the parent chain to the nearest named ancestor, so sub-thread conversations show their parent's name instead of a bare id. Verified: 01a0c060, 01a0bd52 (children of 01a0bc60) now show "Review Mnemosyne memory"; rename prefills the name.
+- Also ruled out "different versions": only one `pinga` binary exists (match of target/release), debug + release both read the DB identically.
+
+## [2026-09-22] FIX: rename/click hit the wrong session (off-by-one with headers)
+- Symptom: renaming a session changed a DIFFERENT list item (the top of a same-named group); the selected row's rename prefilled/acted on another session.
+- Root cause: `sel` was an index into `visual_rows` (which INCLUDES group subheaders), but the highlight used a selectable-only count (headers excluded). With a header present they diverged by the number of headers, so `focused_session()` (rename target, `i` modal) returned a session off from the highlighted one.
+- Fix: `sel` is now consistently an index into SELECTABLE space (New + sessions, headers excluded): `selectable_sessions()` orders sessions (interrupted/running/closed), `focused_session` maps sel via it, `move_cursor` clamps in selectable space, mouse clicks convert visual→selectable via `sel_from_visual`, refresh just clamps range. Verified: sel1→01a0c060, sel2→01a0bc60, sel3→01a0bd52; rename prefills the selected thread's name.
+
+## [2026-09-22] rename no longer reshuffles the list
+- Symptom: after a rename the session seemed to "switch places"; user suspected it renamed a different session.
+- Root cause: pinga's codex rename bumped `updated_at_ms`, and the list sorts by `updated_at_ms DESC` — so every rename moved the session to the top. Combined with several threads sharing one display name (sub-threads inheriting the parent's name), this made it look like the wrong row was renamed. The rename itself targets the highlighted row correctly.
+- Fix: rename only sets `name` (does NOT touch `updated_at_ms`), so renames never reorder the list. Added a stable id tiebreak to the codex sort so equal timestamps don't jitter. Verified: renaming 01a0bd52 left updated_at_ms identical.
+- The user's suggested "order by session ID" was superseded by fixing the reorder at the root; kept the useful most-recent-first sort. Offer id-ordering as an option if still wanted.
+
+## [2026-09-22] mouse defaults to ON when available
+- pinga's mouse now defaults to ON when a mouse looks usable: in tmux, only if tmux's mouse mode is on (tmux must forward events); standalone, always on (modern terminals report mouse). Enabled via a startup EnableMouseCapture when the default is on. 'm' still toggles.
+- Found: tmux.conf already has `set -g mouse on`. If the user still sees no mouse over macOS+ssh, it's the terminal/ssh not sending mouse events (terminal-side), not pinga.
+- New launcher helper: `tmux_mouse_on()` (reads `tmux show -g mouse`).

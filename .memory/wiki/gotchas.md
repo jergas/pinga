@@ -92,3 +92,18 @@ tracked window that stops running its session (e.g. `/exit`) is DROPPED from
 tracking, never flagged interrupted — otherwise an intentional close shows as a
 false "interrupted". A session in `opened` but gone from the server is dropped
 with a one-time "removed from tracking" notice.
+
+## pinga concurrency: opened.json is a shared flock-ed registry (2026-09-20)
+Multiple pinga instances are supported: `~/.local/state/pinga/opened.json` is
+the single source of truth, written atomically (tmp+rename) under an exclusive
+`flock` (opened.lock, `fs2`). Every instance reloads it each refresh, so one
+instance's opens/closes converge into the others. Never write it with plain
+`std::fs::write` — go through `update_opened`.
+
+## codex thread names moved to state_*.sqlite (2026-09-22)
+codex 0.155 dropped `session_index.jsonl`; thread names/titles/cwd/model live in
+`~/.codex/state_*.sqlite` (`threads` table). The numeric suffix varies across
+releases, so locate it by globbing `state_*.sqlite` and checking for a `threads`
+table. A thread's id is the FULL trailing UUID in the rollout filename
+(8-4-4-4-12), not the last 12 hex chars — using the truncated id fails the join
+and yields no names.

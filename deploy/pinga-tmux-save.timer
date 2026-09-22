@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically snapshot the tmux layout so it survives a reboot
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+Unit=pinga-tmux-save.service
+
+[Install]
+WantedBy=timers.target
