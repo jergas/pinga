@@ -77,3 +77,244 @@
 - pinga's mouse now defaults to ON when a mouse looks usable: in tmux, only if tmux's mouse mode is on (tmux must forward events); standalone, always on (modern terminals report mouse). Enabled via a startup EnableMouseCapture when the default is on. 'm' still toggles.
 - Found: tmux.conf already has `set -g mouse on`. If the user still sees no mouse over macOS+ssh, it's the terminal/ssh not sending mouse events (terminal-side), not pinga.
 - New launcher helper: `tmux_mouse_on()` (reads `tmux show -g mouse`).
+
+## [2026-09-22] DOCS | Reconcile blueprint prose with current implementation
+- Corrected Codex SQLite metadata/rename, inherited labels, full UUIDs, legacy fallback limitations, diagram, contracts, and planned acceptance checks.
+- Documented existing two-provider coupling, creation behavior, naming/auto-rename gaps, terminal handoff, and actual tangle/check workflow. No executable chunks changed.
+- User accepted compiled-in provider registration for the forthcoming abstraction; implementation remains deferred until the architecture is agreed. Preserve the existing literate workflow for the implementation handoff.
+- Validation: all 12 executable chunks identical to HEAD; make tangle left all 12 generated files byte-for-byte unchanged; git diff --check passed.
+
+## [2026-09-22] DESIGN | PA-01 architecture and Stage 1 DeepSeek handoff
+- Prepared docs/provider-architecture.md revision 1, a bounded Stage 1 task, and an explicitly not-started report template. Added memory index/pointer.
+- Stage 1: validated stable IDs, trait-object provider registry, built-in composition, and fixture tests. Existing UI/launcher/tracking behavior remains transitional; later stages require separate reviewed tasks.
+- Chose a fresh DeepSeek/OpenCode session and one implementation writer in the current checkout. User supplies a short kickoff; no agent message was sent and no implementation was started.
+
+## [2026-09-22] IMPL | PA-01 Stage 1 landed: provider identity + registry (DeepSeek/OpenCode)
+- Implemented Stage 1 through blueprint chunks, not src/ directly: `core-model`, `prov-mod`, `prov-opencode`, `prov-codex`, `prov-codex-tests`, `tui-app`, `core-main`.
+- Added `ProviderId` (validated lowercase id), `SessionKey`, `Session.provider_id`, `ProviderDescriptor`; removed `ProviderKind` and `AnyProvider`. Trait `kind()` -> `descriptor()`.
+- `ProviderRegistry` (Box<dyn Provider>, ordered, duplicate-ID error, lookup by id) + `builtin_registry(cfg)` composition. App routes through the registry by index; `App::new` now fallible, error propagates via existing terminal cleanup.
+- Validation: 11 automated tests pass (identity, registry, dispatch/failure isolation, built-in composition, opencode `from_value` + codex temp-home `list()` identity fixtures); `make check/test/lint` green; repeat tangle byte-identical; `git diff --check` clean. `ProviderKind`/`AnyProvider` absent from src; no concrete adapter ctors in app.
+- Report: docs/handoffs/PA-01-stage-1-report.md. Ready for architect review; three-provider UI and later stages remain separate reviewed tasks.
+
+## [2026-09-22] REVIEW-FIX | PA-01 Stage 1 corrections R1/R2 (DeepSeek/OpenCode)
+- R1: made `SessionKey` fields private with immutable `provider()`/`native_id()` accessors; validated constructor remains the only construction path. Temporary sibling-module compile probe confirmed both bypass forms rejected (E0451 construct, E0616 field access); probe removed, tree re-tangled.
+- R2: added `builtin_composition_wires_config_into_adapters` (non-default OpenCode URL + temp Codex home fixture through `builtin_registry`); rewrote dispatch test with recorded create/rename (recipient+args) via `Arc<Mutex<Calls>>` and a separate `CreateFake` for successful create, base `Fake` keeps default unsupported create; fixture sessions now carry the fake's real provider id; duplicate test verifies the original's behavior survives a distinguishable replacement.
+- Gates green: check ok, 12 tests pass, lint ok, repeat tangle byte-identical, `git diff --check` clean. Report updated with evidence and new test count. Ready for architect re-review; no Stage 2 work started.
+
+## [2026-09-22] IMPL | PA-01 Stage 2 landed: capabilities, structured launches, evidence (DeepSeek/OpenCode)
+- Replaced `attach_command`/server-only-`create` with `ProviderCapabilities`, `resume_plan -> LaunchRequest`, `create -> CreateOutcome::{KnownSession,LaunchToCreate}`, `match_session -> Vec<WindowMatch>`; added typed `Unsupported` (distinct from failure) and `check_session_belongs`.
+- Launcher rewritten with injectable `ProcReader` (NUL-delimited /proc cmdline + bounded children), `Tmux`, and `Foreground` seams; generic `ProcessEvidence` collector; POSIX-sh `exec` serializer at the tmux boundary; `run_guarded` guarantees terminal restoration on spawn failure; explicit `decide_open` adoption policy replaces silent newest-session auto-adoption with a warning + force.
+- App dispatches new-session/resume generically; KnownSession retained + opened (created-but-not-opened on plan/launch failure); LaunchToCreate tracked as in-memory `PendingLaunch` (never empty native ID; removed only on confirmed window death). Refresh retains last snapshot on failure and keeps first-reconcile eligibility; reconciliation uses adapter evidence and only drops a tracked client on complete proof it ended.
+- Gates: check ok, 25 tests pass (from 12), lint ok, repeat tangle byte-identical, `git diff --check` clean. Report: docs/handoffs/PA-01-stage-2-report.md. App event-loop not unit-tested (reads real opened.json / real launcher); seams + policy are. Ready for architect review; Stage 3 out of scope.
+
+## [2026-09-22] REVIEW-FIX | PA-01 Stage 2 corrections R1-R5 (DeepSeek/OpenCode)
+- R1: `decide_open` now selects a tracked window only on Confirmed evidence (liveness alone insufficient), dedups candidate window ids.
+- R2: TmuxCli checks subprocess exit status; `compute_interrupted` treats window_alive errors and ambiguous/heuristic matches as unknown (retain), drops only on a complete no-match; per-record `startup_eligible` consumes only when that record's initial reconcile was possible.
+- R3: `ProcFs::tree` marks bounded-descendant truncation incomplete; `parse_cmdline` preserves empty args and rejects truncated/non-UTF-8; adapters match exact executable basename and return Ambiguous for unparseable forms; OpenCode endpoint normalizes scheme/host only (path case + host-prefix preserved); codex uniqueness guarded against stale snapshots via `provider_ok`.
+- R4: `open_in_tmux` invokes POSIX sh explicitly via tmux's argv interface (fake-tmux asserted); shared `validate_launch` rejects NUL in program/args/cwd/env; non-UTF-8 cwd rejected; real suspend/run/restore behind injectable `Terminal` seam; refresh after foreground return in both paths.
+- R5: `App::with` injects registry/launcher/`OpenedStore`/`Terminal`; `PendingLaunch` carries ProviderId; KnownSession validates a nonempty SessionKey at the boundary; visible pending status; capability-driven new-row/rename/form hints; app-level orchestration tests + fake third provider.
+- Gates: check ok, 44 tests pass (from 25), lint ok, repeat tangle byte-identical, `git diff --check` clean. Report updated with R1-R5 evidence. Ready for architect re-review; Stage 3 out of scope.
+
+## [2026-09-22] REVIEW-FIX | PA-01 Stage 2 corrections A-C (second review, DeepSeek/OpenCode)
+- A: startup eligibility now keyed by (provider, session id, window id); membership preserved, never granted to a later record; unknown evidence (no collection) retains the record AND keeps eligibility. Sequence tests: later open never gains eligibility, unknown evidence keeps it then interrupts on a later dead window, window replacement never inherits eligibility.
+- B: adapters match only exact supported argv shapes (opencode attach [id-less or -s id]; codex resume <target>); recognized exe + unknown syntax => Ambiguous (never absence); dangling/duplicate -s, leading/trailing unknown options, resume-without-target all ambiguous. OpenCode endpoint parsing splits authority at first '/'/'?'/'#', preserves query bytes + path case, normalizes non-root trailing slash; root `?Token=A` no longer folded into host.
+- C: `suspend_for` refuses to launch after a failed suspension, always restores, surfaces combined launch+restore errors (tested via `App::suspend_for`, not `run_guarded`); `open_session` returns OpenResult::{Opened,Refused,Failed} and checks resume capability before planning; `create_new_session` reports created-but-not-opened and retains identity on foreground/tmux spawn failure with no re-create and no record; current_dir failure/non-UTF-8 is an explicit error; two-slot test fixture; distinct fake window ids per launch.
+- Gates: check ok, 56 tests pass (from 44), lint ok, repeat tangle byte-identical, `git diff --check` clean. Report updated with A-C evidence table. Ready for architect re-review; Stage 3 out of scope.
+
+## [2026-09-22] REVIEW-FIX | PA-01 Stage 2 corrections D/E (third review, DeepSeek/OpenCode)
+- D: `endpoint_parts` made genuinely bounded and non-panicking (byte-index authority cut at first `/`/`?`/`#` so multibyte hosts like `http://é/abc` no longer panic); empty scheme/host, userinfo, and fragments rejected as Unknown. Endpoint comparison is a tri-state `EndpointRel::{Equal,Different,Unknown}`; a malformed endpoint in an otherwise-accepted attach shape is Unknown→Ambiguous, never "positively different", so tracking is never dropped on unparseable evidence. Removed the obsolete `endpoints_match` bool and the contradictory stacked comments.
+- E: `create_new_session` keeps locally-created known sessions in an in-memory `locally_created` set (keyed by SessionKey identity); `refresh` merges them into successful snapshots without duplicates until the authoritative list observes them (then normal policy applies). A created identity now survives an empty list + plan/tmux spawn failure across immediate/subsequent refreshes; retry resumes without re-creating; eventual list visibility yields no duplicate rows and then ordinary removal.
+- Gates: check ok, 60 tests pass (from 56), lint ok, repeat tangle byte-identical, `git diff --check` clean. Report updated with D/E evidence + corrected startup_eligible tuple description. Ready for architect review; Stage 3 out of scope.
+
+## [2026-09-22] REVIEW-FIX | PA-01 Stage 2 endpoint-validation invariant (fourth review, DeepSeek/OpenCode)
+- `endpoint_parts` is now a documented bounded ASCII HTTP(S) subset: scheme exactly http/https; reject non-ASCII/whitespace/control/backslash/userinfo/fragment/IPv6 as Unknown (never panicking on multibyte hosts); host must be DNS/IPv4-shaped (dot-separated alnum labels + internal hyphens, no leading/trailing hyphens; all-numeric dotted hosts only as valid 4-octet IPv4); port exactly one ':' + decimal u16; path/query preserved with only agreed trailing-slash normalization; malformed percent escapes rejected. Unknown endpoint in an accepted attach shape is Ambiguous (never Different), so malformed evidence cannot erase tracking.
+- Added table-driven `endpoint_validation_subset_table` covering every rule + valid equal/different; extended malformed-ambiguous cases (`http://bad host:4096`, `http://localhost:99999`, `1http://…`, Unicode no-panic); integrated `malformed_endpoint_evidence_routes_through_adapter_into_reconciliation` registering the REAL opencode adapter in the app and preserving record + startup eligibility on malformed argv through `compute_interrupted`. Removed unused-mut test warnings.
+- Gates: check ok, 62 tests pass (from 60), lint ok, repeat tangle byte-identical, `git diff --check` clean. Report updated. Ready for architect review; Stage 3 out of scope.
+
+## [2026-09-22] IMPL | PA-01 Stage 3 landed: configurable instances, generic views, stable tracking (DeepSeek/OpenCode)
+- Config: optional `[[providers]]` (id/type/label/enabled/options), fallible load (missing explicit PINGA_CONFIG / invalid TOML are errors), explicit providers authoritative over legacy fields + env; validation (unique IDs incl. disabled, blank labels, unknown type/options even when disabled).
+- Factories: compiled-in type-key→factory registry; `build_registry` (explicit providers in order, skip disabled) vs `builtin_registry` (legacy). `ProviderDescriptor.display_name` now owned String; adapters parse/validate `url` (opencode) and absolute `home` (codex).
+- Tracking: new `core::tracking` — `tracking-v2.json`/`.lock` with pinned envelope (version 2, next_id, tagged known/pending/opaque records), locked reread-mutate-atomic-write (temp+sync+rename), last-good view on read failure, monotonic ids under lock, one-shot legacy migration with exact-bytes backup (`opened-v1-migration-backup.json`, never overwritten), 0→opencode/1→codex, empty ids→pending, unknown indices→opaque; legacy never rewritten once v2 exists.
+- App: per-provider views replace parallel arrays; viewport shows ≤2 columns (1 on narrow), focus wraps full sequence scrolling the viewport; mouse maps visible rects to providers; deferred plans keep provider; empty state for zero providers; listing identity/nonempty-id validation is provider-local; pending persisted, visible after restart, resolved only on unique confirmed evidence; interruption retained across polls (fixes second-poll drop); later opens never inherit startup eligibility.
+- Gates: check ok, 63 tests pass (from 62), lint ok, repeat tangle byte-identical, `git diff --check` clean. Report: docs/handoffs/PA-01-stage-3-report.md. No live migration; ready for architect review.
+
+## [2026-09-22] REVIEW-FIX | PA-01 Stage 3 corrections R1-R7 (DeepSeek/OpenCode)
+- R1: exact one-read legacy migration snapshot under both locks; durable conflict-checked backup (conflicting backup aborts, identical retry safe, atomic publish + dir sync). R2: validate persisted envelope invariants on decode+commit (nonzero unique ids, next_id > max, provider ids, nonempty native ids); read failures surfaced (app keeps last-good); MemStore allocates ids + validates. R3: reconcile computes plans outside the lock and applies only to the exact observed record id/window/state; startup eligibility keyed by record id; pendings preserved while provider unavailable; commit-failure does not consume eligibility/notices.
+- R4: codex resume+create launch plans carry CODEX_HOME; ProcEvidence narrow env (CODEX_HOME from /proc/environ); codex source discrimination (differing home never confirmed, unestablished source ambiguous). R5: selection preserved by SessionKey across reorder; per-view scroll drives render + mouse; spawn/tracking failure reports the launched window; foreground launch-to-create returns failure honestly. R6: config read-error semantics (only NotFound defaults), secret-safe parse diagnostics, registry built before raw mode. R7: restored behavioral regression coverage, clippy --all-targets clean.
+- Gates: check ok, 74 tests pass, lint ok, clippy --all-targets ok, repeat tangle byte-identical, `git diff --check` clean. Report updated. Ready for architect review; Stage 4 unassigned.
+
+## [2026-09-22] REVIEW-FIX | PA-01 Stage 3 corrections A-D (second review, DeepSeek/OpenCode)
+- A: refresh captures the tracking snapshot BEFORE listing providers; records added concurrently fall outside the observed generation and are preserved by the conditional commit. Startup eligibility seeded at construction (never inherited by later records). Plans carry eligible/preserve intent; still/gone derived only from APPLIED outcomes; failed commit consumes nothing.
+- B: launched-but-unrecorded windows kept in an explicit list; retry records the existing window without respawning; removed only on successful recording or confirmed death. Retry test checks create/spawn/tracking counters across persistent failure and recovery.
+- C: per-view scroll drives both rendered row window and mouse hit-testing; selection preserved after regroup. (True multi-line item-height accounting remains a documented limitation.)
+- D: MemStore stores an Envelope behind the mutex retaining next_id across deletion; codex source comparison is conservative (only validated exact absolute match is Same; else Unknown, never a positive Different); restored combined-cleanup, ambiguous-evidence reconciliation, foreground-honesty, and capability/pending regression tests.
+- Gates: check ok, 78 tests pass, lint ok, clippy --all-targets ok, repeat tangle byte-identical, `git diff --check` clean. Report updated. Ready for architect review; Stage 4 unassigned.
+
+## [2026-09-22] REVIEW | PA-01 Stage 1 changes requested
+- Independent check/test/lint passed (11 tests); generated source matched blueprint and repeat tangling was byte-identical. Executable changes stayed in Stage 1 scope.
+- R1: SessionKey public fields bypass its nonempty-ID constructor check; confirmed direct construction and mutation in a compiled temporary probe.
+- R2: complete custom-config composition, successful create/rename dispatch, and distinguishable duplicate non-replacement acceptance tests; current report overstates this coverage.
+- Review/correction packet: docs/handoffs/PA-01-stage-1-review.md. No implementation edits by architect; Stage 2 remains unassigned.
+
+## [2026-09-22] REVIEW | PA-01 Stage 1 accepted after corrections
+- R1 resolved: private SessionKey fields/read-only accessors; independent compile probes rejected both bypass forms (E0451/E0616).
+- R2 resolved: custom config wiring, recorded successful rename/create dispatch, and distinguishable duplicate rejection tests.
+- Independent check/test/lint passed (12 tests), generated-source fidelity and repeat tangling passed, git diff --check clean. No implementation edits or deployment by architect.
+- Acceptance: docs/handoffs/PA-01-stage-1-review-2.md. Next is a bounded Stage 2 packet; no Stage 2 implementation is assigned yet.
+
+## [2026-09-22] DESIGN | PA-01 Stage 2 full integration handoff
+- Prepared Stage 2 task/report template; architecture revision 2 assigns capabilities, structured execution, explicit creation outcomes, and adapter-owned attachment evidence together, with one final review.
+- Pinned conservative adoption, terminal restoration, creation failure handling, in-memory pending-launch limitation, and retention on failed observation. Stage 3 owns persisted-format migration and generic views/config.
+- Same DeepSeek/OpenCode implementation session; larger autonomous batch per user request, no implementation or messaging by architect. Task: docs/handoffs/PA-01-stage-2.md.
+
+## [2026-09-22] REVIEW | Stage 2 consolidated corrections requested
+- Independent check/test/lint, whitespace, and tangle fidelity passed (25 tests). Stage 2 not accepted.
+- R1–R5 in docs/handoffs/PA-01-stage-2-review.md: require positive tracked-window identity; preserve tracking/startup eligibility through unknown inspection; correct process/URL evidence; test real shell/terminal boundaries; finish capability/pending/lifecycle integration and app tests.
+- DeepSeek authorized to inject storage/launcher/terminal dependencies and correct the entire affected flow in one batch. Stage 3 deferred; architect changed no executable code.
+
+## [2026-09-22] REVIEW | Stage 2 second review: three remaining correction groups
+- Independent gates pass (44 tests, lint/check, generated fidelity/repeat tangle, diff whitespace). Prior tracked-window identity and shell-boundary fixes improved.
+- Startup eligibility is still granted to later records on transient failure and lost on total evidence failure; a temporary-copy regression test reproduced the former.
+- Unknown CLI forms still become absence; actual application terminal/spawn error tests and resume capability guard remain incomplete; report overstates this evidence.
+- Active packet: docs/handoffs/PA-01-stage-2-review-2.md (A–C). No production source edits by architect. Stage 3 unassigned.
+
+## [2026-09-22] REVIEW | Stage 2 third review: endpoint and creation retention blockers
+- Independent 56 tests/check/lint, repeat-tangle fidelity and whitespace gates pass.
+- Reproduced Unicode-host parser panic and acceptance of an empty authority in a temporary Rust probe; malformed endpoints still become proof of absence.
+- Created identity retention still depends on immediate list visibility; current test preloads the created session and masks snapshot replacement.
+- Correction packet: docs/handoffs/PA-01-stage-2-review-3.md (D/E). Same implementer; no executable source edits or Stage 3 assignment.
+
+## [2026-09-22] REVIEW | Stage 2 fourth review: endpoint validation remains
+- 60 tests/check/lint and tangle/whitespace gates pass; test compile has unused-mut warnings. Creation retention accepted.
+- Temporary unchanged-parser probes show malformed host, alphabetic/overflowing port and invalid scheme all return Different, not Unknown.
+- Active packet PA-01-stage-2-review-4.md pins conservative URL grammar and real adapter-to-app evidence coverage. No executable edits. Recommend implementer High reasoning.
+
+## [2026-09-22] REVIEW | Stage 2 accepted; Stage 3 assigned
+- 62 tests and check/lint, whitespace and repeat-tangle fidelity pass without prior test warnings. Real OpenCode adapter evidence reaches app reconciliation in regression test.
+- Acceptance: docs/handoffs/PA-01-stage-2-review-5.md. Stage 3 packet and report template prepared; architecture revision 3.
+- Decisions: compiled-in factories with explicit per-instance config; bounded generic viewport; separate v2 tracking file with one-time locked legacy snapshot and exact backup, no cross-version convergence. Stable interrupted state and pending persistence required.
+- Same High-reasoning DeepSeek session, full batch delegated; no source edits or live state migration by architect.
+
+## [2026-09-22] REVIEW | Stage 3 correction batch; small UI fixes applied directly
+- Independent baseline: 63 tests/check/lint and tangle/whitespace gates pass, with 11 test compile warnings. Structural work substantial but not accepted.
+- R1–R7: migration snapshot/backup correctness, persisted invariants/read errors, conditional reconciliation outside locks, per-instance Codex source, UI selection/scrolling and launch errors, config loading, restored regression coverage/report accuracy.
+- Architect directly corrected positional colors, per-column new capability styling and capability-driven modal notes in blueprint; added real TestBackend modal test. 64 tests pass.
+- Active packet docs/handoffs/PA-01-stage-3-review.md; same High implementer. No live state touched.
+
+## [2026-09-22] REVIEW | Stage 3 second review and bounded direct fixes
+- Baseline 74 tests plus check/all-target clippy/fidelity/whitespace pass. Migration snapshot and validated conditional writes improved; remaining A–D packet created.
+- Architect fixes through blueprint: propagate directory sync errors, Unknown for absent Codex source metadata, safe empty-view cursor movement, preserve new-session-row selection; regression assertions added.
+- Remaining lifecycle race/retry/layout/fixture issues assigned in PA-01-stage-3-review-2.md. No live migration or deployment.
+
+## [2026-09-22] REVIEW | Stage 3 closure plus bounded Antigravity spike assigned
+- 78 tests/all-target lint/fidelity/whitespace pass; layout explicitly incomplete and retry test re-creates against a fixed-ID fake. Stage 3 not accepted.
+- Combined packet PA-01-stage-3-review-3-antigravity.md closes layout/retry/interleaving gaps then authorizes read-only Antigravity investigation and optional fixture-tested adapter. No live mutation/deployment.
+- No code edits by architect this round; combined batch conserves review round trips.
+
+## [2026-09-22] IMPL | PA-01 Stage 3 Phase A closure + Antigravity spike (DeepSeek/OpenCode)
+- A1: real-height line-based scroll/mouse mapping (removed VISIBLE_ROWS; item heights incl. headers/two-line rows; render + selection highlight + hit-testing share one mapping; zero-provider guard).
+- A2: launch recovery by re-opening the retained session; bypasses evidence/adoption; never calls create again; distinct-ID fake test asserts create count stays 1 across persistent failure + recovery.
+- A3: unrecorded pending identity = provider+label+cwd; liveness checked at retry (confirmed death not recorded; failed inspection retains).
+- A4: interleaving replacement test via shared store handles; pending/ambiguous/combined-cleanup sequences restored.
+- A5: removal notice is an accurate generic reason, not "deleted from server".
+- Phase B: discovered NO installed Antigravity product (only empty cache staging dir + passive ai-memory hooks documenting a JSON-stdout event contract). No verified session surface -> no adapter implemented (evidence + blocker in docs/antigravity-integration.md), plus manual test checklist + opt-in config shape.
+- Gates: check ok, 78 tests pass, lint ok, clippy --all-targets ok, repeat tangle byte-identical, `git diff --check` clean. Report updated. Ready for architect review; Stage 4/Pi unassigned.
+
+## [2026-09-23] IMPL | PA-01 Phase B corrected: Antigravity IS installed as `agy` v1.2.9 (was uninitialised)
+- Correction: earlier report claimed no Antigravity product. Wrong — `~/.local/bin/agy` (Google exa/jetski lineage) exists; the app data dir ~/.gemini/antigravity-cli/ was empty until initialisation. Verified `--conversation <id>` exact resume, `--continue`, `--new-project`, `conversation_summaries.db` SQLite index, and `ANTIGRAVITY_APP_DATA_DIR` env override.
+- Implemented optional adapter src/provider/antigravity.rs (blueprint §5.3): compiled-in factory for type "antigravity", NOT auto-registered (builtin_registry stays opencode+codex). list() reads the summary SQLite read-only; resume = agy --conversation <id>; create = plain agy in cwd; match_session confirms exact UUID, conservative on --continue/unknown argv, foreign data dir -> Ambiguous (mirrors codex CODEX_HOME). Rename honestly unsupported (TUI /rename only; summary DB is a reconciled cache).
+- Docs corrected: docs/antigravity-integration.md rewritten with real evidence + config example; report Phase B + validation updated (84 tests, +6 adapter tests).
+
+## [2026-09-23] REVIEW | Antigravity prototype corrections and direct boundary fixes
+- Optional agy adapter submitted; baseline tests/all-target lint/fidelity passed. Stage 3/layout/retry acceptance remains pending.
+- Architect corrected launcher source metadata collection for agy, SQLite read-only open, and propagation of malformed rows; added malformed-row regression.
+- Active packet docs/handoffs/PA-01-antigravity-review.md covers remaining core/layout/retry and adapter path/time/evidence/integration issues. No live provider operation by architect.
+
+## [2026-09-23] IMPL | PA-01 antigravity review batch — corrections complete
+- Scrolling: one shared list_layout (visual rows, line heights, column inner height from last_height; selectable->visual mapping) drives move_cursor/render/highlight/hit-test; long-list TestBackend test asserts RENDERED text + DISPATCHED SessionKey at short/tall sizes with headers + two-line rows.
+- Launch recovery: pending launches get unique tokens; retry is explicit (retry_unrecorded(token)); ordinary new always spawns; known-key retry preserved; liveness error retains state (tested incl. failed inspection + confirmed death).
+- Deterministic file-store interleaving: RacingStore seam commits a concurrent replacement via a second real FileTrackingStore INSIDE the first read-modify-write; conditional commit preserves it.
+- Antigravity parsing: first_workspace decodes file:// URIs/percent/JSON/bare paths; comma+unknown -> None. parse_go_datetime_ms is checked/validated (invalid, pre-epoch, offset, >6-digit frac -> None). Missing DB = fresh; existing-but-unopenable = error. Non-UTF-8 home rejected, not lossy. REAL /proc collector -> adapter env test.
+- Testing path: two-homes config test + real-adapter-through-app list/resume/track; complete opt-in config + manual checklist in docs/antigravity-integration.md; report rewritten with requirement->test map + honest completed/blocked. Gates: 97 tests, lint/clippy clean, idempotent tangle, diff-check clean.
+
+## [2026-09-23] REVIEW | Candidate ready for supervised Antigravity smoke test
+- Final batch reviewed; direct fixes expose pending-token retry via p and bound timestamp conversion.
+- Sample opt-in config and isolated-tracking manual test instructions prepared in PA-01-manual-test-ready.md. No live launch, normal config change or deployment.
+- Runtime behavior remains unverified until user performs disposable conversation/new/list/exact-resume checks.
+
+## [2026-09-23] DIAGNOSE | First Antigravity live smoke: empty index
+- User opened agy from Pinga and refreshed with g; no listed session. Read-only query confirms configured conversation_summaries table has 0 rows; conversations directory has 0 files.
+- No evidence yet of adapter filtering a persisted conversation. Asked whether a first message was sent; opening a client alone may not persist a conversation (hypothesis, not verified). No live data or code changed.
+
+## [2026-09-23] PAUSE | Provider development paused for message passing
+- User confirmed live agy creation after first message, automatic listing, exact conversation resume, and existing-window selection for resumed clients.
+- Known limitations: native creation window lacks provable session identity; entered name is tmux label, not native title.
+- User requests suspension of this line and discussion of separate-session/project message passing. Checkpoint saved; no further provider implementation.
+
+## [2026-09-24] ASSIGN | PB-01 external project browser
+- User confirmed scope and remaining limits 30%/85%. Original prompts establish FOSS requirement, copyleft preference, and external-browser-first scope; Mnemosyne local-folder/sync remains separate.
+- Packet docs/handoffs/PB-01-project-browser.md revision 1. Confirmed builder ses_f317e9fbeffe9uLy8WUt4vc05Z, title test-messaging, DeepSeek V4 Flash High; API status idle before dispatch.
+- Direct native prompt_async returned HTTP 204 for pinga-pb01-assignment-01. Delivery submitted, not yet acknowledged/completed. Reply to architect 01a0cb2e-e31c-7e33-8094-ac926ac14b53 via existing native queue.
+- No dependency install/live config edits/deployment. Provider development remains paused.
+
+## [2026-09-24] BUILD | PB-01/1 external project browser implemented (submitted for review)
+
+`b` opens a Browse project directory form (prefill = focused session dir or pinga cwd);
+launch Yazi rooted there via the existing LaunchRequest seams (new tmux window, or
+foreground suspend/restore). Markdown->Glow (-p), text/code->bat (--paging=always) as
+Yazi 26.9.1 block openers in the SAME window; wildcard fallback lets bat refuse
+binaries clearly. Private Yazi profile via YAZI_CONFIG_HOME under PINGA_STATE_DIR
+(persistent, never deleted). No tracking writes/provider calls; tools checked early.
+New generated module src/browse.rs; app integration in src/tui/app.rs
+(EditState::Browse, injectable tools_check seam, state_dir).
+Gates green: tangle (15 files), cargo check, 108 tests, clippy --all-targets -D
+warnings, repeat-tangle fidelity, git diff --check. Only bat on PATH; no real
+Yazi/Glow smoke claimed; install instructions in docs/handoffs/PB-01-report.md.
+Report: docs/handoffs/PB-01-report.md (SUBMITTED, not accepted).
+
+## [2026-09-24] REVIEW | PB-01 corrections dispatched
+- Independent 108 tests/all-target lint/fidelity/whitespace pass. Not accepted: Browse errors hidden behind form; Yazi default opener precedence; missing Glow/bat isolation; profile publication race and root/path issues.
+- Packet docs/handoffs/PB-01-review-1.md sent to existing DeepSeek builder ses_f317e9fbeffe9uLy8WUt4vc05Z (user elected to retain that builder after routing correction). Native prompt_async HTTP 204, message pinga-pb01-review-01. No install or global edits.
+
+## [2026-09-24] FIX | PB-01 review-1 corrections applied (119 tests)
+
+Fixed per docs/handoffs/PB-01-review-1.md: errors render beside the editable form
+(modal+inline, rendered-buffer tests); Yazi [open] rules fully overridden (no default
+editors/xdg-open/extractors ahead), -- end-of-options before %s, unsupported -> clear
+refusal; full three-tool isolation (YAZI_CONFIG_HOME, GLOW_CONFIG_HOME,
+BAT_CONFIG_PATH, BAT_PAGER/PAGER); unique-temp atomic profile publication
+(concurrent-writer test); canonical-absolute paths + reject non-UTF-8; PINGA_STATE_DIR
+scoped to browsing only (tracking reverted to platform state dir); prefill requires an
+existing dir (fallback to cwd tested); literal paths preserve leading/trailing spaces;
+zero-provider key-handler test; real failure-path tests (tmux failure, spawn failure
++restore, partial suspend never launches). Report updated with doc-verified vs
+executable-tested split; Debian Yazi install claim removed (Arch host).
+
+## [2026-09-24] REVIEW | PB-01 viewer boundary follow-up
+- 119 tests/all-target lint/whitespace pass. Earlier defects improved.
+- Upstream Glow source shows config-home prepends paths (empty dir not isolation), MaximumNArgs(1), and color-aware pager needs. Active packet PB-01-review-2.md dispatched natively HTTP 204 to same DeepSeek builder, message pinga-pb01-review-02. No installs/global edits.
+
+## [2026-09-24] FIX | PB-01 review-2 viewer boundary corrections (119 tests)
+
+Per docs/handoffs/PB-01-review-2.md: published valid minimal glow.yml (glow
+PREPENDS GLOW_CONFIG_HOME, empty dir falls through to personal config) and
+neutralized ambient GLOW_* (GLOW_TUI=false); single-file viewer policy %s1
+glow/bat (cobra MaximumNArgs(1) forbids multi-file), recorder test re-labelled
+and re-scoped to one hostile file at a time; color-preserving pager pinned to
+less -R (PAGER/BAT_PAGER) with LESS="" to neutralize ambient immediate-exit
+flags, less added to the pre-launch tool check; fallback failures user-visible.
+Source-reviewed glow main.go (current main). No installs/global edits. Report
+updated: docs/handoffs/PB-01-report.md.
+
+## [2026-09-24] REVIEW | PB-01 candidate ready for real-tool smoke
+- Independent 119 tests/all-target lint/fidelity/whitespace pass; reviewed final viewer-boundary changes. No further builder assignment.
+- bat/less installed; local Arch metadata offers yazi 26.9.1-2 and glow 3.0.0-2 (MIT). Request user approval for system package installation outside prior no-install batch.
+- docs/handoffs/PB-01-smoke-ready.md records outstanding executable/interactivity tests; no installation/deployment performed.
+
+## [2026-09-24] TEST | Installed viewer smoke
+- User installed Yazi/Glow. Verified Yazi 26.9.1 and Glow 3.0.0; cargo build passes. Real Glow/bat process tests with private configs and a recording pager render a Markdown filename containing quotes/spaces/Unicode successfully. Interactive Yazi routing/return still pending user test.
+- Bare glow --version attempted default config creation, blocked by sandbox; isolated private-config invocation passed without error. No global configuration changed by architect.
+
+## [2026-09-24] ACCEPT | Browser live smoke passes; contrast polish deferred
+- User confirms browser/viewer/return flow works. Reports low-contrast blue/white information widgets at lower-left/right; owning tool not yet verified.
+- Explicitly defer contrast work due to remaining limits 19%/13%. Recorded only, no implementation changes.

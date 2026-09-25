@@ -1,0 +1,20 @@
+# Explicit list: preserve the historical OpenCode/Codex sources.
+# Adjust these paths/endpoint if your regular Pinga configuration differs.
+[[providers]]
+id = "opencode"
+type = "opencode"
+[providers.options]
+url = "http://127.0.0.1:4096"
+
+[[providers]]
+id = "codex"
+type = "codex"
+[providers.options]
+home = "/home/edgar/.codex"
+
+[[providers]]
+id = "agy"
+type = "antigravity"
+label = "Antigravity"
+[providers.options]
+home = "/home/edgar/.gemini/antigravity-cli"

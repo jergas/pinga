@@ -59,9 +59,9 @@ opencode rename has NO documented v2 route in 1.18.29 — the six candidate form
 (POST/PATCH/PUT × /session/<id> and /session/<id>/rename) all return the SPA
 HTML with HTTP 200 when a form is wrong (silent no-op). pinga's rename probes
 all six and re-reads the session to confirm the title actually changed (rule in
-blueprint §16.3). External rename for codex = append {"id","thread_name",
-"updated_at"} to ~/.codex/session_index.jsonl (codex's own contract; newest
-append wins).
+blueprint §16.3). Historical Codex 0.154 naming used an append to
+~/.codex/session_index.jsonl; this was superseded by SQLite naming in 0.155
+(see the 2026-09-22 entry below).
 
 ## tmux-resurrect had NO save file until a systemd timer was added (2026-09-19)
 A power failure killed tmux with zero snapshot: `~/.tmux/resurrect/` was empty,
@@ -107,3 +107,13 @@ releases, so locate it by globbing `state_*.sqlite` and checking for a `threads`
 table. A thread's id is the FULL trailing UUID in the rollout filename
 (8-4-4-4-12), not the last 12 hex chars — using the truncated id fails the join
 and yields no names.
+
+## Literate prose and executable chunks need separate review (2026-09-22)
+Tangling only extracts code; it does not validate prose against implementation.
+The documentation audit found old index-based Codex naming, a claimed automatic
+rename trigger that does not run, and a test plan described without noting that
+there are no automated tests. `make check/test/lint` do not tangle first; run
+`make tangle` explicitly. Current Codex rename still falls back to a legacy
+index append on a failed/no-row DB update, although listing ignores that file.
+Codex resume uses resolved display titles, including non-unique inherited
+ancestor labels; do not mistake those labels for stable session identity.

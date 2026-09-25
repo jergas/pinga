@@ -4,6 +4,7 @@
 
 * [Architectural Decisions](adrs/0001-initial-stack.md)
 * [Persistent Cross-Machine Agent Sessions on eris](adrs/0002-persistent-agent-sessions.md)
+* [Provider abstraction and implementation handoff](notes/provider-abstraction.md)
 
 ## Execution Knowledge
 
