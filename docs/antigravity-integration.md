@@ -134,6 +134,19 @@ list documents what a live check would verify.
 | 7 | Scroll a long list below the viewport at short and tall sizes; click the visible selected row | The selected row stays visible (rendered text); the click dispatches that session's key | Headers + two-line (detail) rows are counted by line height in the shared layout |
 | 8 | Rename a conversation | Unsupported (error, capability flag off) | Only the TUI `/rename` exists; the summary DB is a reconciled cache, so direct writes would be fabricated surface |
 
+## 5b. User-facing limits (minimum publishable scope)
+
+- A newly created plain-agy launch (`+ new session`) cannot prove which native
+  conversation it will produce. Pinga conservatively reports such a launch as
+  Ambiguous and never infers identity from cwd, title or time. Appearing in the
+  summary index makes the conversation listable, but does not identify its
+  original window. Resuming it through Pinga with its exact ID makes subsequent
+  window tracking possible.
+- Native conversation titles are owned by Antigravity (agy's TUI `/rename`
+  command only). A Pinga "new session" name labels the tmux window only; it
+  does not change or predict the native conversation title. Renaming through
+  Pinga is intentionally unsupported.
+
 ## 6. Tests and validation
 
 - Unit + integration tests (temp-dir fixture DBs): list mapping/sort/instance-id,

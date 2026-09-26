@@ -4469,6 +4469,17 @@ pub const GLOW_YML: &str = concat!(
     "width: 100\n",
 );
 
+/// Private browser colors: pale green on dark purple and pale purple on dark
+/// green. Keep the override under `[mode]` to preserve the indicator layout;
+/// the earlier `[status]` override failed the user's visual check.
+pub const THEME_TOML: &str = concat!(
+    "# Pinga browse theme override (Yazi 26.9.1)\n",
+    "# Preserve the default status layout; customize mode colors only.\n",
+    "[mode]\n",
+    "normal_main = { fg = \"#a5e5aa\", bg = \"#352044\", bold = true }\n",
+    "normal_alt = { fg = \"#d3a4ef\", bg = \"#173d2a\" }\n",
+);
+
 /// The isolated Yazi profile. The `[open]` rules are FULLY overridden (never
 /// appended), so Yazi's defaults — external editors, `xdg-open`, archive
 /// extractors — never precede our viewers: Markdown → Glow, text/code → bat,
@@ -4509,13 +4520,15 @@ fn publish(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// (Re)publish the private profile: the Yazi config, a minimal bat config, a
-/// minimal pinned Glow config (published, not empty — see GLOW_YML), and the
-/// private Glow home. Returns the canonical (absolute) profile dir.
+/// (Re)publish the private profile: the Yazi config, a private theme override,
+/// a minimal bat config, a minimal pinned Glow config (published, not empty —
+/// see GLOW_YML), and the private Glow home. Returns the canonical (absolute)
+/// profile dir.
 pub fn ensure_profile(state_dir: &Path) -> Result<PathBuf> {
     let dir = profile_dir(state_dir);
     std::fs::create_dir_all(&dir)?;
     publish(&dir.join("yazi.toml"), YAZI_PROFILE)?;
+    publish(&dir.join("theme.toml"), THEME_TOML)?;
     publish(&dir.join("bat.conf"), BAT_CONF)?;
     let glow_home = dir.join("glow");
     std::fs::create_dir_all(&glow_home)?;
@@ -4701,6 +4714,8 @@ mod tests {
         assert!(cfg.contains("bat --paging=always -- %s"));
         assert!(cfg.contains("block = true"));
         assert!(fs::read_to_string(dir.join("bat.conf")).unwrap().contains("minimal bat config"));
+        assert!(fs::read_to_string(dir.join("theme.toml")).unwrap().contains("[mode]"),
+            "the private Yazi theme override must be published");
         assert!(fs::read_to_string(dir.join("glow").join("glow.yml")).unwrap().contains("pager: true"),
             "a valid glow.yml must be published so viper finds it before personal config");
         assert!(dir.join("glow").is_dir());
@@ -4800,6 +4815,25 @@ mod tests {
             }
         }
         panic!("opener {name} not found in profile");
+    }
+
+    #[test]
+    fn browse_theme_override_targets_low_contrast_status_widgets() {
+        // Verified against the installed Yazi 26.9.1 in a PTY: a `[mode]`
+        // override fixes the blue/white mode block and PRESERVES the status
+        // bar layout (the right-hand tab indicator stays). A `[status]`
+        // override (even `overall` alone) makes the right-hand tab indicator
+        // disappear, so the override must NOT touch `[status]`.
+        assert!(THEME_TOML.contains("[mode]"));
+        assert!(THEME_TOML.contains("normal_main = { fg = \"#a5e5aa\", bg = \"#352044\", bold = true }"));
+        assert!(!THEME_TOML.lines().any(|l| l.trim_start().starts_with("[status]")),
+            "a [status] table hides the right tab indicator in Yazi 26.9.1");
+        assert!(!THEME_TOML.contains("bg = \"blue\""),
+            "the bare blue background of the shipped mode block must be replaced");
+        for untouched in ["[which]", "[input]", "[manager]", "[confirm]"] {
+            assert!(!THEME_TOML.contains(untouched),
+                "override must not restyle unrelated widgets ({untouched})");
+        }
     }
 
     #[cfg(unix)]
@@ -8603,7 +8637,10 @@ relocates provider tracking). It works from an installed pinga binary, is never
 repo-relative, and is never deleted while a tmux window could still reference
 it. Profile files are published atomically under unique temp names, so
 concurrent pinga instances never corrupt the profile. Pinga writes nothing to
-the user's Yazi/Glow/bat config.
+the user's Yazi/Glow/bat config. A private `theme.toml` gives the directory
+browser's normal-mode blocks pale green text on dark purple and pale purple
+text on dark green. Only `[mode] normal_main/normal_alt` are overridden;
+the default status layout is preserved.
 
 Missing viewers (yazi, glow, bat, and the pinned pager `less`) are checked
 before launch with actionable names. File-argument boundaries (spaces, quotes,
@@ -8626,7 +8663,12 @@ filesystem confinement boundary.
   a full `rules = [...]` override. The shipped default rules route `text/*` to
   `$EDITOR`, images/media to `xdg-open`, and archives to extractors — our
   private profile overrides `rules` so those defaults never precede our
-  viewers. The older `$@`-style syntax is NOT used. License: MIT
+  viewers. The older `$@`-style syntax is NOT used. Shipped theme
+  (`yazi-config/preset/theme-dark.toml`) puts the lower-right mode block on a
+  bare `bg = "blue"` with the default white foreground; the private profile
+  overrides `[mode] normal_main` only — verified in a PTY against the installed
+  Yazi 26.9.1 that a `[status]` table hides the right-hand tab indicator, so
+  `[status]` is not overridden. License: MIT
   (`https://github.com/sxyazi/yazi`).
 - **Glow** (`https://github.com/charmbracelet/glow`, source-reviewed on current
   `main`, `main.go`): `-p` pager mode; pager is `$PAGER` or the default

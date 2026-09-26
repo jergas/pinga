@@ -318,3 +318,55 @@ updated: docs/handoffs/PB-01-report.md.
 ## [2026-09-24] ACCEPT | Browser live smoke passes; contrast polish deferred
 - User confirms browser/viewer/return flow works. Reports low-contrast blue/white information widgets at lower-left/right; owning tool not yet verified.
 - Explicitly defer contrast work due to remaining limits 19%/13%. Recorded only, no implementation changes.
+
+## [2026-09-26] FIX | PB-02/1 pre-push closure (120 tests)
+
+Task 1 (contrast): identified the owning UI as Yazi's shipped status bar —
+yazi-config/preset/theme-dark.toml [mode] normal_main = { bg = "blue", bold = true }
+(bare blue bg + default white fg) at the lower-right mode block, with the
+lower-left status info under [status] overall. Fixed via a private profile
+theme.toml (new THEME_TOML published by ensure_profile) pinning explicit
+high-contrast fg/bg pairs for [status] overall + [mode] normal_main/alt.
+Smallest local adjustment; no global theme changes/new deps; regression asserts
+no unrelated widgets are restyled.
+
+Task 2 (provider loose ends): no small release-blocking production defect found
+(unwraps/expects are test-only). Limits already conservatively handled
+(plain-agy launches Ambiguous, never inferred by cwd/title/time; rename
+unsupported; title labels window only). Added explicit user-facing limits note
+to docs/antigravity-integration.md (5b). No new providers/title hacks/
+speculative identity.
+
+Gates green: tangle 15 files, cargo check, 120/120 tests, clippy --all-targets
+-D warnings, repeat-tangle fidelity, git diff --check. No commits/push/install.
+Report: docs/handoffs/PB-02-report.md.
+
+Review correction: viewer dependencies and PB-01 user smoke were already complete;
+only new contrast needs visual confirmation. Listing does not identify the original
+plain-agy window; exact-ID resume enables tracking. No Git remote configured.
+
+## [2026-09-24] FIX | PB-02/2 contrast regression (120 tests)
+
+User live test FAILED the first PB-02 contrast patch: corner indicators
+(disappeared). Verified against installed Yazi 26.9.1 in an isolated PTY:
+overriding ANY [status] table (even overall alone) hides the right 1/ tab
+indicator and adds a left separator; [mode] alone is safe. Narrowed THEME_TOML
+to [mode]-only (normal_main white on #2d5aa0); re-verified PTY status row
+byte-identical to baseline with indicators restored and mode block recolored.
+Lower-left status colors remain Yazi defaults (reported uncertainty; a [status]
+override is unsafe in 26.9.1). Provider limits unchanged (docs/antigravity-
+integration.md 5b). Gates green: tangle, cargo check, 120/120, clippy
+--all-targets -D warnings, fidelity, diff --check. No commits/push/install.
+Report: docs/handoffs/PB-02-report.md.
+
+## [2026-09-26] UPDATE | Browser green/purple palette
+User clarified the contrast concern is in the directory browser and requested
+green/purple. Set normal_main to pale green on dark purple and normal_alt to
+pale purple on dark green; retain the mode-only override and default status layout.
+
+User confirmed good browser contrast; slightly deepened green/purple text to
+#a5e5aa and #d3a4ef so their hues are more apparent, keeping dark backgrounds.
+
+## [2026-09-26] ACCEPT | Browser palette approved
+User accepted the final green/purple colors. Preparing the authorized public
+jergas/pinga repository and push; provider limitations remain documented.
