@@ -370,3 +370,18 @@ User confirmed good browser contrast; slightly deepened green/purple text to
 ## [2026-09-26] ACCEPT | Browser palette approved
 User accepted the final green/purple colors. Preparing the authorized public
 jergas/pinga repository and push; provider limitations remain documented.
+
+## [2026-09-27] BUG | Newly launched Codex session absent from Pinga list
+User opened the new Astra "fresh architect" session through Pinga's new-session
+function in the current tmux session, but it does not appear in Pinga's session
+list. User supplied the live thread ID: 01a0e595-aede-70f0-9436-bf8a2ba09bd1.
+Recorded for investigation; not reproduced or diagnosed. Do not assume this is
+the earlier Antigravity pre-first-message listing behavior. Check discovery,
+refresh, and active Codex storage/config scope when investigating.
+
+## [2026-09-28] CHECKPOINT | Ready for tmux restart
+Pinga provider/browser/README work is published and accepted. Both Pinga DeepSeek
+implementers have completed their assigned batches and were idle at verification.
+Preserved Fresh's recoverable transcript and cross-project restart notes under
+ignored .memory/tmp/restart-2026-09-28/ (outside system /tmp). Missing newly-created
+Codex session discovery remains a recorded, undiagnosed bug; no fix attempted.
