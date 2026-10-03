@@ -385,3 +385,26 @@ implementers have completed their assigned batches and were idle at verification
 Preserved Fresh's recoverable transcript and cross-project restart notes under
 ignored .memory/tmp/restart-2026-09-28/ (outside system /tmp). Missing newly-created
 Codex session discovery remains a recorded, undiagnosed bug; no fix attempted.
+
+## [2026-09-22] HANDOFF | wrote handoff-and-future.md + linked in index
+Comprehensive state-of-project / roadmap / last-words doc written to
+.memory/wiki/handoff-and-future.md and linked from index.md. Covers: what pinga
+is, commit-history summary, future directions (mouse-over-ssh, codex manual
+test, codex app-server protocol, order-by-id option, pinga-name registry,
+session_id surfacing), feature ideas (status/token dashboard, filtering,
+pinning, SSE activity alerts, configurable keys, multi-server), and "famous
+last words" for future incarnations (literate build discipline, gates before
+commit, one-opencode-server rule, codex state DB + full-UUID gotcha,
+update_opened-only mutations, selectable-indexed sel, no-reorder rename,
+tmux-vs-bare modes, cautious-user working style, ai-memory scope).
+
+## [2026-10-03] tmux auto-restore broken + systemd restore service
+- After a reboot, tmux-resurrect did NOT auto-restore: tpm loads no plugins on a
+  fresh server, so continuum's @continuum-restore never fires. The session was
+  only recoverable by manually running tmux-resurrect's restore.sh.
+- Fix: added `deploy/pinga-tmux-restore` + `pinga-tmux-restore.service`
+  (systemd user unit, WantedBy=default.target, runs once at boot): starts a
+  tmux server if none, runs resurrect restore from ~/.tmux/resurrect/last,
+  drops the bootstrap session. `make install` deploys + enables it.
+- Restored the user's `pinga` session (11 windows) manually; verified the
+  restore script works; save timer still active (every 10 min).
