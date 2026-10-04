@@ -20,7 +20,8 @@ machine) through pinga itself, instead of a manual `ssh`.
 Initial milestone: a configured remote host (`eris`) whose public key pinga
 generated and installed, tested with a `BatchMode` probe, and which
 `pinga remote connect` attaches to by running the remote's own `pinga` (the
-remote's bring-up + console) over `ssh -t`.
+remote's bring-up + console) over `ssh -t`. Accepted 2026-10-04 (validated
+mac → eris).
 
 Steps: `[[remotes]]` config (name/host/user/port/key) in a pinga-owned file →
 `pinga remote add|list` → per-host ed25519 key generation (`~/.ssh/pinga-<name>`,
