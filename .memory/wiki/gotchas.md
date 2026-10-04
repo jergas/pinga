@@ -129,3 +129,19 @@ runs at boot) starts a tmux server if none and runs resurrect `restore.sh` from
 `~/.tmux/resurrect/last`. Belt-and-suspenders alongside the save timer
 (`pinga-tmux-save`). `make install` deploys+enables both. Do NOT rely on
 continuum auto-restore for reboot survival.
+
+## opencode sessions are scoped per-project (cwd) in opencode.db (2026-10-03)
+opencode serves sessions from `~/.local/share/opencode/opencode.db` keyed by
+PROJECT (the server's cwd). The systemd :4096 server runs with cwd=/home/edgar
+→ the "global" 15 sessions. A bare `opencode` run from a project directory
+spawns a server scoped to THAT project → `/sessions` can be EMPTY. Always use
+`opencode attach http://127.0.0.1:4096` (pinga does) or run opencode from
+/home/edgar. A bare `opencode -s <id>` window spawns its own short-lived server
+(dead after client restart) and its marker makes pinga think the session is
+open — close and reopen such windows via pinga.
+
+## pinga: dead tracked windows poisoned evidence (fixed 2026-10-03)
+`collect_evidence` used to scan tracked windows even when they no longer exist
+(stale ids after tmux-resurrect restore). A dead window's pane lookup failed
+and marked the whole snapshot incomplete → EVERY open refused ("cannot inspect
+running windows right now"). Fixed: only alive tracked windows are scanned.

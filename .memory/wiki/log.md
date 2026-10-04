@@ -408,3 +408,39 @@ tmux-vs-bare modes, cautious-user working style, ai-memory scope).
   drops the bootstrap session. `make install` deploys + enables it.
 - Restored the user's `pinga` session (11 windows) manually; verified the
   restore script works; save timer still active (every 10 min).
+
+## [2026-10-03] FIX: dead tracked windows poisoned every open + scope notes
+- Symptom: opening ANY session refused with "cannot inspect running windows
+  right now; f to force". Root cause: after the reboot + tmux-resurrect restore,
+  tracking-v2.json held stale window ids (@17/@45/@51) that no longer exist.
+  `collect_evidence` added those tracked windows to the scan list, their
+  `pane_root_pids` lookup failed, and the failure marked the WHOLE evidence
+  incomplete -> decide_open -> RefuseIncomplete for every session.
+- Fix: `collect_evidence` now only scans tracked windows that still exist
+  (`window_alive`); dead stale ids are skipped so the scan stays complete.
+  Interrupted sessions then open normally (verified: pinga-subagent + a closed
+  session both spawned windows; the opened interrupted session left the
+  interrupted group).
+- ALSO (issue 1): a bare `opencode` serves sessions scoped to its cwd's
+  PROJECT (opencode.db is per-project); from /home/edgar it shows the global 15,
+  but from a project dir (e.g. /home/edgar/projects/pinga) /sessions is EMPTY.
+  The shared :4096 server (cwd=/home/edgar) is the global store. Use
+  `opencode attach http://127.0.0.1:4096` (which pinga does) or run from
+  /home/edgar. The stale tmux window running bare `opencode -s <id>` (own dead
+  server) should be closed and reopened via pinga.
+
+## [2026-10-03] FIX: bare `opencode -s <id>` windows made every open "uncertain"
+- Symptom: after a reboot + restore, opening ANY session refused with
+  "uncertain whether already open elsewhere" even for sessions known closed.
+- Root cause: the restored tmux layout had a window running bare
+  `opencode -s <id>` (no endpoint). OpencodeProvider::match_session treated any
+  unrecognized opencode argv shape as AMBIGUOUS evidence, so that one window
+  made every opencode session look "maybe open elsewhere" -> RefuseUncertain.
+- Fix: recognize `opencode -s <id>` as an explicit-session form: confirmed when
+  the id matches the target session, no candidate otherwise (mirrors the
+  `attach <endpoint> -s <id>` handling). Verified in a reproduction session
+  (bare `opencode -s <id>` window present; opening a different session spawned
+  a window). 120 tests pass.
+- NOTE for future agents: NEVER run `pgrep -af "opencode" | xargs kill` — it
+  also kills the agent's own opencode client (the session quit when I did this).
+  The user's own clients may also run `opencode -s <id>`; use tmux pane kills.
