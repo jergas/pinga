@@ -4,6 +4,11 @@ After=network.target
 
 [Service]
 Type=oneshot
+# RemainAfterExit keeps the unit active (exited) after the script returns, so
+# systemd does NOT tear down the unit's cgroup — which would kill the tmux
+# server the script spawned, silently discarding the restored layout
+# (verified 2026-10-04: without it the restored windows died with the unit).
+RemainAfterExit=yes
 ExecStart=%h/.local/bin/pinga-tmux-restore
 
 [Install]

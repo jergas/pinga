@@ -1,0 +1,10 @@
+[Unit]
+Description=Bring up the pinga tmux session and reconcile agent windows after boot
+After=network.target opencode.service pinga-tmux-restore.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/pinga up
+
+[Install]
+WantedBy=default.target

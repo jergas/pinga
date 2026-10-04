@@ -55,6 +55,7 @@ recent-user-text input and R5's automatic trigger are not implemented (see §12)
 | R9 | In tmux: open session in **another window** of the same session | `tmux new-window -t <current session> -n <label> "<attach cmd>"` |
 | R10 | Own terminal: **pass control** of the terminal to the session, return when it exits | Suspend alt-screen + raw mode → run attach cmd with inherited stdio → re-enter |
 | R11 | **Mostly purple and green**, good readability | Palette in §14; text pairs meet WCAG-AA-ish contrast on the dark background |
+| R12 | **Bring the console back after a reboot** | Bare `pinga` outside tmux ensures the configured tmux session + one window per tracked open session (resuming the agents), then attaches; `pinga up` is the headless form for boot; `make install` enables the boot unit |
 
 Non-goals (out of scope): editing session content, multi-machine sync, a web
 UI, or supporting zsh-era multiplexers beyond tmux.
@@ -140,6 +141,12 @@ future upstream releases.
 - Inside tmux, `$TMUX` is set; current session name via
   `tmux display-message -p '#{S}'`; a new window in it via
   `tmux new-window -t <name> -n <label> '<command>'`.
+- Outside tmux (reboot bring-up, R12): `tmux has-session -t <name>` probes for
+  a session (non-zero when absent); `tmux new-session -d -s <name> -n <label>
+  -P -F '#{window_id}' '<command>'` creates a detached one and reports its first
+  window id; `tmux attach -t <name>` attaches a client; `tmux list-windows -t
+  <name> -F '#{window_id}'` lists a specific session's windows regardless of the
+  server's current session.
 
 ### 5.4 The one-server rule (from the split-brain incident, 2026-09-16)
 
@@ -222,6 +229,7 @@ input while they run.
 | `prov::antigravity` | `src/provider/antigravity.rs` | §5.3 optional adapter (SQLite summary index + `agy` resume/create/evidence), compiled-in, NOT auto-registered |
 | `name::engine` | `src/naming.rs` | Ollama/keyed suggestion + heuristic fallback |
 | `core::launcher` | `src/launcher.rs` | evidence collector, foreground runner, tmux ops, POSIX-sh serializer, adoption policy |
+| `core::bringup` | `src/bringup.rs` | R12 reboot bring-up: ensure tmux session + pinga TUI window, reconcile tracked agents (verify/adopt/repair/launch) |
 | `core::tracking` | `src/tracking.rs` | versioned v2 store, locked atomic writes, legacy migration + backup |
 | `tui::theme` | `src/tui/theme.rs` | purple/green palette (§14) |
 | `tui::app` | `src/tui/app.rs` | the console: per-provider views, viewport, keys, mouse, handoff loop |
@@ -296,6 +304,33 @@ input while they run.
   replaces the old silent newest-session auto-adoption with an uncertainty
   warning + force-to-open. New-session and resume dispatch generically; pending
   (launch-to-create) launches are in-memory only until Stage 3.
+- **D12 Reboot bring-up: pinga owns agent revival, resurrect stays as the layout
+  safety net (2026-10-03, R12).** Layered, not either/or. Boot chain via systemd
+  user units: `opencode.service` (the :4096 server) → `pinga-tmux-restore.service`
+  (replays tmux-resurrect's snapshot, restoring manual/non-pinga windows that
+  pinga cannot know) → `pinga-up.service` (runs `pinga up`): reconcile the
+  configured tmux session against `tracking-v2.json`. Resurrect revives windows,
+  not agents, so pinga verifies each tracked record by pane argv
+  (`collect_evidence` + `match_session` Confirmed) and repairs stale window ids
+  (resurrect reassigns them). A tracked-but-not-running session is **restarted
+  inside the window it ran in before interruption** — records carry the
+  window's restore identity (index/name, replayed by resurrect; backfilled
+  from live windows when missing), and only an idle shell pane is ever
+  respawned in place (a busy window is refused, a new window never created);
+  with no identity/candidate the session stays in the console's list for the
+  user to relaunch. Records are deferred when evidence is incomplete, identity
+  is ambiguous, a provider's listing fails, or the session is gone from the
+  listing. `pinga up` touches only tracked records and the pinga TUI window —
+  never other windows. **One session** (default `main`,
+  configurable via `tmux_session`/`PINGA_TMUX_SESSION`), window 0 = the pinga TUI
+  (recursive invocation: inside tmux, bare `pinga` runs the console); no "+ new
+  session" tmux window — the TUI row covers it. Bare `pinga` outside tmux runs
+  bring-up then attaches; inside tmux it stays the plain console (D5 unchanged).
+  **One console per session:** a second `pinga` inside the same tmux session is
+  refused and the user is switched to the running console's window (best-effort
+  select, `guard_console`); quitting the console never tears the session down —
+  agents and manual windows outlive it, so a quit+restart in the same window
+  just resumes the console.
 
 ## 9. Data contracts
 
@@ -458,6 +493,7 @@ pub struct Config {
     pub theme: String,                 // "magic" (the purple/green palette)
     pub list_detail: String,           // "two-line" (default) | "bottom" — codex row layout
     pub forms: String,                 // "modal" (default) | "inline" — form dialog style
+    pub tmux_session: String,          // R12: the single tmux session bring-up owns
 }
 
 impl Default for Config {
@@ -477,6 +513,7 @@ impl Default for Config {
             theme: "magic".into(),
             list_detail: "two-line".into(),
             forms: "modal".into(),
+            tmux_session: "main".into(),
         }
     }
 }
@@ -516,6 +553,9 @@ impl Config {
         if let Ok(m) = std::env::var("PINGA_MODEL") {
             if cfg.ollama_base_url.is_some() { cfg.ollama_model = Some(m.clone()); }
             if cfg.api_base_url.is_some() { cfg.api_model = Some(m); }
+        }
+        if let Ok(s) = std::env::var("PINGA_TMUX_SESSION") {
+            if !s.trim().is_empty() { cfg.tmux_session = s; }
         }
         cfg.validate()?;
         Ok(cfg)
@@ -746,6 +786,27 @@ mod tests {
             [providers.options]
             url = "http://x"
         "#).is_err());
+    }
+
+    #[test]
+    fn tmux_session_default_config_and_env_override() {
+        assert_eq!(Config::default().tmux_session, "main", "R12 default session");
+        let tmp = std::env::temp_dir().join(format!("pinga-cfg-tmux-{}", std::process::id()));
+        std::fs::write(&tmp, "tmux_session = \"work\"\n").unwrap();
+        std::env::set_var("PINGA_CONFIG", &tmp);
+        let cfg = Config::load().unwrap();
+        assert_eq!(cfg.tmux_session, "work");
+        // The environment wins over the config file.
+        std::env::set_var("PINGA_TMUX_SESSION", "ops");
+        let cfg2 = Config::load().unwrap();
+        assert_eq!(cfg2.tmux_session, "ops");
+        // A blank env value is ignored (keeps the configured value).
+        std::env::set_var("PINGA_TMUX_SESSION", "  ");
+        let cfg3 = Config::load().unwrap();
+        assert_eq!(cfg3.tmux_session, "work");
+        std::env::remove_var("PINGA_TMUX_SESSION");
+        std::env::remove_var("PINGA_CONFIG");
+        std::fs::remove_file(&tmp).ok();
     }
 }
 ```
@@ -1061,6 +1122,21 @@ pub trait Provider: Send + Sync {
         _evidence: &ProcessEvidence,
     ) -> Vec<WindowMatch> {
         Vec::new()
+    }
+    /// As `match_session`, but with the names the session was previously known
+    /// by (pinga stores them across its own renames). Adapters that match
+    /// clients by TITLE — codex `resume <name>` keeps the name from open time —
+    /// must use them so a rename does not blindside the matcher. The default
+    /// ignores them.
+    fn match_session_aliased(
+        &self,
+        session: &Session,
+        aliases: &[String],
+        snapshot: &[Session],
+        evidence: &ProcessEvidence,
+    ) -> Vec<WindowMatch> {
+        let _ = aliases;
+        self.match_session(session, snapshot, evidence)
     }
 }
 
@@ -2441,6 +2517,15 @@ impl CodexProvider {
     /// non-default home is Unknown (ambiguous), never a confirmed adoption.
     fn match_session(&self, session: &Session, snapshot: &[Session],
                      evidence: &ProcessEvidence) -> Vec<WindowMatch> {
+        self.match_session_aliased(session, &[], snapshot, evidence)
+    }
+
+    /// `match_session` plus the names pinga recorded for this session across
+    /// its own renames: a `resume <target>` whose target is one of them is
+    /// confirmed identity, because the running client's argv never changes.
+    fn match_session_aliased(&self, session: &Session, aliases: &[String],
+                             snapshot: &[Session], evidence: &ProcessEvidence)
+        -> Vec<WindowMatch> {
         let mut out: Vec<WindowMatch> = Vec::new();
         for w in &evidence.windows {
             let mut confirmed = false;
@@ -2467,9 +2552,23 @@ impl CodexProvider {
                                 .filter(|s| s.title.as_deref() == Some(target.as_str()))
                                 .count();
                             if count == 1 { confirmed = true; } else { ambiguous = true; }
+                        } else if aliases.iter().any(|a| a == target) {
+                            // The client runs under a name pinga itself gave
+                            // the session earlier: this IS the session.
+                            confirmed = true;
+                        } else if snapshot.iter().any(|s| s.id == *target
+                            || s.title.as_deref() == Some(target.as_str())) {
+                            // A fully understood resume of ANOTHER session: no
+                            // candidate for ours.
+                        } else {
+                            // The target matches NO current session: the client
+                            // runs a thread under a stale name (pinga renames
+                            // threads — the window argv keeps the OLD title), so
+                            // it could be OURS. Unidentifiable is Ambiguous,
+                            // never absence: a rename must not silently drop a
+                            // running session's record (2026-10-04 fix).
+                            ambiguous = true;
                         }
-                        // a fully understood resume of another session: no
-                        // candidate for ours.
                     }
                     _ => { ambiguous = true; } // recognized exe, unknown syntax
                 }
@@ -3528,6 +3627,32 @@ mod tests {
     }
 
     #[test]
+    fn renamed_thread_with_stale_resume_target_is_ambiguous_not_absent() {
+        // The window's `codex resume <target>` argv carries the title from when
+        // the session was opened; pinga renames threads afterwards. A target
+        // that matches NO current session could still be OUR session under an
+        // old name -> Ambiguous, never "no candidate" (which would silently
+        // drop the running session's record). A target that provably belongs to
+        // another session stays a clean negative.
+        let p = CodexProvider::new(Path::new("/nonexistent"), ProviderId::new("codex").unwrap());
+        let renamed = session(UUID, Some("New Name")); // renamed after opening
+        let other = session("22222222-2222-3333-4444-bbbbbbbbbbbb", Some("Other"));
+        let snap = vec![renamed.clone(), other.clone()];
+        // The client still resumes under the OLD title: unidentifiable -> ambiguous.
+        let stale = ev(vec![("@1".into(), vec![vec!["codex".into(), "resume".into(),
+                                                    "Old Name".into()]])]);
+        let m = p.match_session(&renamed, &snap, &stale);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].confidence, MatchConfidence::Ambiguous,
+            "a rename must not erase a running session's record");
+        // A resume of a session that EXISTS in the snapshot is provably not ours.
+        let theirs = ev(vec![("@1".into(), vec![vec!["codex".into(), "resume".into(),
+                                                     "Other".into()]])]);
+        assert!(p.match_session(&renamed, &snap, &theirs).is_empty(),
+            "a known other session's resume is a clean negative");
+    }
+
+    #[test]
     fn resume_plan_uses_title_or_uuid_and_create_is_launch_to_create() {
         let p = CodexProvider::new(Path::new("/nonexistent"), ProviderId::new("codex").unwrap());
         let with_title = session(UUID, Some("My Thread"));
@@ -3819,9 +3944,50 @@ pub trait Tmux: Send + Sync {
     fn mouse_on(&self) -> Result<bool>;
     fn list_window_ids(&self, all: bool) -> Result<Vec<String>>;
     fn pane_root_pids(&self, win: &str) -> Result<Vec<u64>>;
+    /// The window's human-facing `index:name` label (what tmux shows in the
+    /// status bar), e.g. `1:edgar` — distinct from the `@N` window id.
+    fn window_label(&self, win: &str) -> Result<String>;
+    /// Move a window to the front of its session (`tmux move-window -t s:0`),
+    /// so the pinga console is always the first window after bring-up. No-op
+    /// when the window already is first.
+    fn move_window_to_front(&self, win: &str, session: &str) -> Result<()>;
+    /// Rename a window in place (`tmux rename-window`), so the status-bar label
+    /// follows a session rename. Note: renaming changes the window name, which
+    /// is part of a record's restore identity.
+    fn rename_window(&self, win: &str, label: &str) -> Result<()>;
+    /// The window's restore-stable identity (index, name). tmux-resurrect
+    /// replays both after a reboot while reassigning every window id, so this
+    /// is how bring-up finds a session's original window (R12).
+    fn window_index_name(&self, win: &str) -> Result<(u64, String)>;
+    /// Every window of a session with its restore-stable identity.
+    fn session_windows(&self, session: &str) -> Result<Vec<(String, u64, String)>>;
+    /// Replace the pane's process in place (keeping the window, its name and
+    /// position): `tmux respawn-pane -k`. Used by bring-up to restart a
+    /// session in its pre-reboot window. The pane must be verified idle first —
+    /// respawn kills whatever is running in it.
+    fn respawn_pane(&self, win: &str, command: &[String]) -> Result<()>;
+    // R12 bring-up surface: session existence/creation, attach, and window
+    // listing for a NAMED session (independent of the server's current session).
+    fn has_session(&self, name: &str) -> Result<bool>;
+    fn new_session(&self, name: &str, label: &str, command: &[String]) -> Result<String>;
+    fn attach(&self, name: &str) -> Result<()>;
+    fn list_windows(&self, session: &str) -> Result<Vec<String>>;
 }
 
 pub struct TmuxCli;
+
+impl TmuxCli {
+    /// The lowest unused window index of a session (gap-filling), or None when
+    /// the listing cannot be read (the caller then falls back to tmux's own
+    /// choice). The existing indexes are re-read at creation time.
+    fn free_window_index(&self, session: &str) -> Result<Option<u64>> {
+        let out = Command::new("tmux").args(["list-windows", "-t", session, "-F", "#{window_index}"]).output()?;
+        if !out.status.success() { return Ok(None); }
+        let used: Vec<u64> = String::from_utf8_lossy(&out.stdout).lines()
+            .filter_map(|l| l.trim().parse().ok()).collect();
+        Ok(Some(next_free_index(&used)))
+    }
+}
 
 impl Tmux for TmuxCli {
     fn in_tmux(&self) -> bool {
@@ -3838,9 +4004,17 @@ impl Tmux for TmuxCli {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
     fn new_window(&self, session: &str, label: &str, command: &[String]) -> Result<String> {
+        // Compute an explicit free index: with `renumber-windows on`, tmux's
+        // internal next-index counter can point at an occupied index after a
+        // window close, and plain `new-window -t <session>` then FAILS with
+        // "create window failed: index N in use" (reproduced 2026-10-04 after
+        // the console window was closed). `-t <session>:<index>` sidesteps it.
+        let target = self.free_window_index(session)?
+            .map(|idx| format!("{session}:{idx}"))
+            .unwrap_or_else(|| session.to_string());
         let mut args: Vec<String> = vec![
             "new-window".into(), "-P".into(), "-F".into(), "#{window_id}".into(),
-            "-t".into(), session.into(), "-n".into(), label.into(),
+            "-t".into(), target, "-n".into(), label.into(),
         ];
         args.extend(command.iter().cloned());
         let out = Command::new("tmux").args(&args).output()?;
@@ -3884,6 +4058,118 @@ impl Tmux for TmuxCli {
         if !out.status.success() { return Err(anyhow!("tmux list-panes failed")); }
         Ok(String::from_utf8_lossy(&out.stdout).lines()
             .filter_map(|l| l.trim().parse::<u64>().ok()).collect())
+    }
+    fn has_session(&self, name: &str) -> Result<bool> {
+        // A missing tmux server reports non-zero too: absence of the session
+        // (server or not) is exactly the "needs bootstrapping" signal.
+        let status = Command::new("tmux").args(["has-session", "-t", name]).status()?;
+        Ok(status.success())
+    }
+    fn new_session(&self, name: &str, label: &str, command: &[String]) -> Result<String> {
+        let mut args: Vec<String> = vec![
+            "new-session".into(), "-d".into(), "-P".into(), "-F".into(), "#{window_id}".into(),
+            "-s".into(), name.into(), "-n".into(), label.into(),
+        ];
+        args.extend(command.iter().cloned());
+        let out = Command::new("tmux").args(&args).output()?;
+        if !out.status.success() {
+            return Err(anyhow!("tmux new-session failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if id.is_empty() { return Err(anyhow!("tmux new-session returned no window id")); }
+        Ok(id)
+    }
+    fn attach(&self, name: &str) -> Result<()> {
+        let status = Command::new("tmux").args(["attach", "-t", name]).status()?;
+        if !status.success() { return Err(anyhow!("tmux attach failed")); }
+        Ok(())
+    }
+    fn list_windows(&self, session: &str) -> Result<Vec<String>> {
+        let out = Command::new("tmux").args(["list-windows", "-t", session, "-F", "#{window_id}"]).output()?;
+        if !out.status.success() { return Err(anyhow!("tmux list-windows failed")); }
+        Ok(String::from_utf8_lossy(&out.stdout).lines()
+            .map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+    }
+    fn window_label(&self, win: &str) -> Result<String> {
+        let out = Command::new("tmux")
+            .args(["display-message", "-t", win, "-p", "#{window_index}:#{window_name}"]).output()?;
+        if !out.status.success() {
+            return Err(anyhow!("tmux display-message failed"));
+        }
+        let label = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if label.is_empty() { return Err(anyhow!("tmux returned no window label")); }
+        Ok(label)
+    }
+    fn rename_window(&self, win: &str, label: &str) -> Result<()> {
+        let out = Command::new("tmux").args(["rename-window", "-t", win, label]).output()?;
+        if !out.status.success() {
+            return Err(anyhow!("tmux rename-window failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(())
+    }
+    fn move_window_to_front(&self, win: &str, session: &str) -> Result<()> {
+        let (index, _) = self.window_index_name(win)?;
+        if index == 0 { return Ok(()); }
+        // tmux move-window does NOT swap: an occupied destination errors
+        // ("index in use: 0"), and `-k` would DESTROY the occupant. Swap
+        // manually: park the window currently at index 0 at a free index,
+        // then move the console into 0.
+        if let Ok(lines) = self.session_windows(session) {
+            if let Some((occ, _, _)) = lines.iter().find(|(_, i, _)| *i == 0) {
+                if occ != win {
+                    let used: Vec<u64> = lines.iter().map(|(_, i, _)| *i).collect();
+                    let free = next_free_index(&used);
+                    let out = Command::new("tmux")
+                        .args(["move-window", "-s", occ, "-t", &format!("{session}:{free}")]).output()?;
+                    if !out.status.success() {
+                        return Err(anyhow!("tmux move-window failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+                    }
+                }
+            }
+        }
+        let out = Command::new("tmux")
+            .args(["move-window", "-s", win, "-t", &format!("{session}:0")]).output()?;
+        if !out.status.success() {
+            return Err(anyhow!("tmux move-window failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(())
+    }
+    fn window_index_name(&self, win: &str) -> Result<(u64, String)> {
+        let out = Command::new("tmux")
+            .args(["display-message", "-t", win, "-p", "#{window_index}|#{window_name}"]).output()?;
+        if !out.status.success() {
+            return Err(anyhow!("tmux display-message failed"));
+        }
+        let line = String::from_utf8_lossy(&out.stdout);
+        let (index, name) = line.trim().split_once('|')
+            .ok_or_else(|| anyhow!("tmux returned no window identity"))?;
+        let index: u64 = index.parse()
+            .map_err(|_| anyhow!("tmux returned a non-numeric window index"))?;
+        Ok((index, name.to_string()))
+    }
+    fn session_windows(&self, session: &str) -> Result<Vec<(String, u64, String)>> {
+        let out = Command::new("tmux")
+            .args(["list-windows", "-t", session, "-F", "#{window_id}|#{window_index}|#{window_name}"]).output()?;
+        if !out.status.success() { return Err(anyhow!("tmux list-windows failed")); }
+        let mut wins = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut parts = line.trim().splitn(3, '|');
+            let (Some(id), Some(index), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            let Ok(index) = index.parse::<u64>() else { continue; };
+            wins.push((id.to_string(), index, name.to_string()));
+        }
+        Ok(wins)
+    }
+    fn respawn_pane(&self, win: &str, command: &[String]) -> Result<()> {
+        let mut args: Vec<String> = vec!["respawn-pane".into(), "-k".into(), "-t".into(), win.into()];
+        args.extend(command.iter().cloned());
+        let out = Command::new("tmux").args(&args).output()?;
+        if !out.status.success() {
+            return Err(anyhow!("tmux respawn-pane failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(())
     }
 }
 
@@ -3944,35 +4230,116 @@ impl Terminal for RealTerminal {
     }
 }
 
+// ---- resurrect request (injectable for fixtures) ----------------------------
+
+/// The seam that asks the systemd boot-restore service to run tmux-resurrect
+/// NOW (outside tmux, when no session exists) and returns its status report.
+/// Injectable so tests never touch systemctl or the user's tmux.
+pub trait Resurrect: Send + Sync {
+    fn request(&self) -> Option<String>;
+}
+
+/// Noop: nothing to ask (used by fixtures).
+pub struct NoopResurrect;
+impl Resurrect for NoopResurrect {
+    fn request(&self) -> Option<String> { None }
+}
+
+/// Starts `pinga-tmux-restore.service` via systemctl (blocking for the
+/// oneshot) and reads its status file, which the deploy script writes as
+/// `OK <n> sessions` / `FAIL <reason>` / `SKIP <reason>`. Returns None when
+/// systemctl is unavailable. Uses `restart`, not `start`: with
+/// `RemainAfterExit=yes` the unit stays `active (exited)` after a run, and
+/// `start` on an active unit is a silent NO-OP that would skip the restore
+/// (observed 2026-10-04: the requested resurrect never ran).
+pub struct SystemdResurrect;
+impl Resurrect for SystemdResurrect {
+    fn request(&self) -> Option<String> {
+        let ok = Command::new("systemctl")
+            .args(["--user", "restart", "pinga-tmux-restore.service"])
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            return Some("could not restart pinga-tmux-restore.service".into());
+        }
+        match std::fs::read_to_string(crate::tracking::state_dir().join("restore-status.txt")) {
+            Ok(s) => Some(s.trim().to_string()),
+            Err(_) => Some("restore service finished but wrote no status".into()),
+        }
+    }
+}
+
 // ---- Launcher facade --------------------------------------------------------
 
 pub struct Launcher {
     proc_reader: Box<dyn ProcReader>,
     tmux: Box<dyn Tmux>,
     foreground: Box<dyn Foreground>,
+    resurrect: Box<dyn Resurrect>,
 }
 
 impl Launcher {
     pub fn real() -> Self {
-        Self { proc_reader: Box::new(ProcFs), tmux: Box::new(TmuxCli), foreground: Box::new(StdioRunner) }
+        Self { proc_reader: Box::new(ProcFs), tmux: Box::new(TmuxCli),
+               foreground: Box::new(StdioRunner), resurrect: Box::new(SystemdResurrect) }
     }
 
     /// Construct with injected seams (for application-level fixtures).
     pub fn with_seams(proc_reader: Box<dyn ProcReader>, tmux: Box<dyn Tmux>,
                       foreground: Box<dyn Foreground>) -> Self {
-        Self { proc_reader, tmux, foreground }
+        Self { proc_reader, tmux, foreground, resurrect: Box::new(NoopResurrect) }
+    }
+
+    /// Replace the resurrect-request seam (default: no-op).
+    pub fn with_resurrect(mut self, resurrect: Box<dyn Resurrect>) -> Self {
+        self.resurrect = resurrect;
+        self
     }
 
     pub fn in_tmux(&self) -> bool { self.tmux.in_tmux() }
+    pub fn current_session(&self) -> Result<String> { self.tmux.current_session() }
+    pub fn request_resurrect(&self) -> Option<String> { self.resurrect.request() }
     pub fn mouse_on(&self) -> Result<bool> { self.tmux.mouse_on() }
     pub fn window_alive(&self, win: &str) -> Result<bool> { self.tmux.window_alive(win) }
     pub fn select_window(&self, win: &str) -> Result<()> { self.tmux.select_window(win) }
+    // R12 bring-up passthroughs.
+    pub fn has_session(&self, name: &str) -> Result<bool> { self.tmux.has_session(name) }
+    pub fn new_session(&self, name: &str, label: &str, command: &[String]) -> Result<String> {
+        self.tmux.new_session(name, label, command)
+    }
+    pub fn attach(&self, name: &str) -> Result<()> { self.tmux.attach(name) }
+    pub fn window_label(&self, win: &str) -> Result<String> { self.tmux.window_label(win) }
+    pub fn rename_window(&self, win: &str, label: &str) -> Result<()> {
+        self.tmux.rename_window(win, label)
+    }
+    pub fn move_window_to_front(&self, win: &str, session: &str) -> Result<()> {
+        self.tmux.move_window_to_front(win, session)
+    }
+    pub fn window_index_name(&self, win: &str) -> Result<(u64, String)> {
+        self.tmux.window_index_name(win)
+    }
+    pub fn session_windows(&self, session: &str) -> Result<Vec<(String, u64, String)>> {
+        self.tmux.session_windows(session)
+    }
+    pub fn respawn_pane(&self, win: &str, command: &[String]) -> Result<()> {
+        self.tmux.respawn_pane(win, command)
+    }
 
     /// Collect a generic process snapshot: every window in the current tmux
     /// session plus any explicitly tracked windows (which may live in other
     /// tmux sessions), with inspection completeness/errors.
     pub fn collect_evidence(&self, tracked_windows: &[String]) -> Result<ProcessEvidence> {
-        let mut ids = self.tmux.list_window_ids(false)?;
+        let ids = self.tmux.list_window_ids(false)?;
+        self.collect_evidence_for(ids, tracked_windows)
+    }
+
+    /// R12: as `collect_evidence`, but rooted at a NAMED session's windows —
+    /// bring-up runs outside tmux where "current session" is undefined.
+    pub fn collect_evidence_in(&self, session: &str, tracked_windows: &[String]) -> Result<ProcessEvidence> {
+        let ids = self.tmux.list_windows(session)?;
+        self.collect_evidence_for(ids, tracked_windows)
+    }
+
+    fn collect_evidence_for(&self, mut ids: Vec<String>, tracked_windows: &[String]) -> Result<ProcessEvidence> {
         for w in tracked_windows {
             if !ids.iter().any(|i| i == w) {
                 // Only scan tracked windows that still EXIST. A dead window's
@@ -4016,11 +4383,17 @@ impl Launcher {
     /// invoked explicitly through tmux's multi-argument command interface so the
     /// user's default shell never interprets it.
     pub fn open_in_tmux(&self, label: &str, req: &LaunchRequest) -> Result<String> {
+        let session = self.tmux.current_session()?;
+        self.open_in_tmux_in(&session, label, req)
+    }
+
+    /// R12: as `open_in_tmux`, but into a NAMED session — bring-up runs outside
+    /// tmux where "current session" is undefined.
+    pub fn open_in_tmux_in(&self, session: &str, label: &str, req: &LaunchRequest) -> Result<String> {
         validate_launch(req)?;
         let cmd = serialize_launch(req)?;
-        let session = self.tmux.current_session()?;
         let argv: Vec<String> = vec!["sh".into(), "-c".into(), cmd];
-        self.tmux.new_window(&session, label, &argv)
+        self.tmux.new_window(session, label, &argv)
     }
 }
 
@@ -4085,6 +4458,16 @@ pub fn run_guarded(l: &Launcher, req: &LaunchRequest, restore: impl FnOnce()) ->
     let r = l.run_in_foreground(req);
     restore();
     r
+}
+
+/// The lowest unused index (gap-filling): 0 when free, else the first missing
+/// index, else max+1. Bounded by construction for small window sets.
+pub fn next_free_index(used: &[u64]) -> u64 {
+    let mut idx = 0u64;
+    while used.contains(&idx) {
+        idx += 1;
+    }
+    idx
 }
 
 // ---- core adoption policy ---------------------------------------------------
@@ -4190,6 +4573,20 @@ mod tests {
     }
 
     #[test]
+    fn next_free_index_gap_fills_and_extends() {
+        // After the console window closed, [1, 2] remain: the free slot is 0.
+        assert_eq!(next_free_index(&[1, 2]), 0);
+        // Contiguous set extends past the max.
+        assert_eq!(next_free_index(&[0, 1, 2]), 3);
+        // A gap in the middle is filled first.
+        assert_eq!(next_free_index(&[0, 2]), 1);
+        // Empty session starts at 0.
+        assert_eq!(next_free_index(&[]), 0);
+        // Unordered input is handled.
+        assert_eq!(next_free_index(&[5, 3, 0]), 1);
+    }
+
+    #[test]
     fn restoration_runs_on_both_success_and_spawn_failure() {
         let l = Launcher::with_seams(Box::new(ProcFs), Box::new(TmuxCli),
                                      Box::new(FakeForeground(true)));
@@ -4225,6 +4622,20 @@ mod tests {
         fn mouse_on(&self) -> Result<bool> { Ok(true) }
         fn list_window_ids(&self, _all: bool) -> Result<Vec<String>> { Ok(vec![]) }
         fn pane_root_pids(&self, _win: &str) -> Result<Vec<u64>> { Ok(vec![]) }
+        fn has_session(&self, name: &str) -> Result<bool> { Ok(name == "main") }
+        fn new_session(&self, _name: &str, _label: &str, _command: &[String]) -> Result<String> {
+            Ok("@0".into())
+        }
+        fn attach(&self, _name: &str) -> Result<()> { Ok(()) }
+        fn list_windows(&self, _session: &str) -> Result<Vec<String>> { Ok(vec![]) }
+        fn window_label(&self, win: &str) -> Result<String> { Ok(format!("0:{win}")) }
+        fn window_index_name(&self, win: &str) -> Result<(u64, String)> { Ok((0, win.into())) }
+        fn session_windows(&self, _session: &str) -> Result<Vec<(String, u64, String)>> { Ok(vec![]) }
+        fn respawn_pane(&self, _win: &str, _command: &[String]) -> Result<()> { Ok(()) }
+        fn rename_window(&self, _win: &str, _label: &str) -> Result<()> { Ok(()) }
+        fn move_window_to_front(&self, win: &str, _session: &str) -> Result<()> {
+            self.moved_to_front.lock().unwrap().push(win.to_string()); Ok(())
+        }
     }
 
     #[test]
@@ -4398,6 +4809,16 @@ mod tests {
                 if self.pane_err.as_deref() == Some(win) { Err(anyhow!("read failed")) }
                 else { Ok(self.panes.get(win).cloned().unwrap_or_default()) }
             }
+            fn has_session(&self, name: &str) -> Result<bool> { Ok(name == "main") }
+            fn new_session(&self, _n: &str, _l: &str, _c: &[String]) -> Result<String> { Ok("@0".into()) }
+            fn attach(&self, _n: &str) -> Result<()> { Ok(()) }
+            fn list_windows(&self, _s: &str) -> Result<Vec<String>> { Ok(self.ids.clone()) }
+            fn window_label(&self, win: &str) -> Result<String> { Ok(format!("0:{win}")) }
+            fn window_index_name(&self, win: &str) -> Result<(u64, String)> { Ok((0, win.into())) }
+            fn session_windows(&self, _s: &str) -> Result<Vec<(String, u64, String)>> { Ok(vec![]) }
+            fn respawn_pane(&self, _w: &str, _c: &[String]) -> Result<()> { Ok(()) }
+            fn rename_window(&self, _w: &str, _l: &str) -> Result<()> { Ok(()) }
+            fn move_window_to_front(&self, _w: &str, _s: &str) -> Result<()> { Ok(()) }
         }
 
         // All panes aggregated; a truncated tree makes the whole snapshot incomplete.
@@ -4908,7 +5329,1126 @@ mod tests {
 }
 ```
 
-### 11.9 Tracking store (`core::tracking`)
+### 11.8c Reboot bring-up (`core::bringup`)
+
+R12. Runs OUTSIDE tmux (bare `pinga` from a fresh shell, or `pinga up` from the
+boot unit). Two responsibilities:
+
+1. **Ensure the one session.** If `tmux has-session` fails, create the session
+   detached with window 0 running the pinga TUI itself (recursive invocation:
+   inside tmux, bare `pinga` is the plain console, D5). If the session already
+   exists (resurrect replay, manual tmux), verify by pane argv that a pinga TUI
+   window is actually running — resurrect revives panes, not processes — and
+   create one if missing. The TUI window is labeled `pinga`.
+2. **Reconcile tracked records.** For every `Known` record in `tracking-v2.json`
+   (state `open`): snapshot the provider listing (retried at boot, since the
+   `opencode.service` HTTP listener may lag the unit start), match the session
+   against live window evidence, then:
+   - **exactly one Confirmed window** → adopt: the session is up; repair the
+     record's window id (resurrect reassigns ids, so the stored `@N` is stale);
+   - **no match, complete evidence, session present in the listing** → the
+     session was interrupted; **restart it inside the window it ran in before
+     interruption** (its restore identity — window index/name, which resurrect
+     replays — finds the successor window; the pane is respawned in place ONLY
+     when it is an idle shell, never when busy, and a new window is never
+     created). No identity/candidate → report **not running**; the session
+     stays in the console's list for the user to relaunch at will;
+   - **anything uncertain** (ambiguous identity, incomplete evidence, listing
+     failure, session gone) → defer with a reason. Non-`Known` records and
+     closed records are deferred untouched.
+
+Bring-up touches only tracked records and the pinga TUI window — never other
+windows (manual windows belong to resurrect). The console itself is ephemeral:
+quitting it never tears the session down, and a second console in the same
+session is refused — and the user redirected to the running one — via
+`guard_console` (`other_tui_in`, a self-excluding pane-argv scan, plus a
+best-effort window select).
+
+``` {.rust #core-bringup path="src/bringup.rs"}
+use anyhow::{anyhow, Result};
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::Duration;
+
+use crate::launcher::{serialize_launch, Launcher};
+use crate::model::{LaunchRequest, MatchConfidence, Session, WindowMatch};
+use crate::provider::{Provider, ProviderRegistry};
+use crate::tracking::{TrackedRecord, TrackedState, TrackingStore};
+
+/// Window label for the pinga TUI window in the bring-up session.
+pub const PINGA_WINDOW_LABEL: &str = "pinga";
+
+/// What happened to one tracked record during reconcile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreAction {
+    /// Already running in a Confirmed window; the record's window id was repaired.
+    Adopted { record_id: u64, window: String },
+    /// Restarted inside the window it ran in before interruption
+    /// (respawn in place; the window kept its name and position).
+    Restored { record_id: u64, window: String },
+    /// Tracked as open but no running client exists anywhere in the session
+    /// and there is no window to restore it into; left untouched for the user
+    /// to relaunch from the console's list.
+    NotRunning { record_id: u64 },
+    /// Left untouched, with a human-readable reason.
+    Deferred { record_id: u64, reason: String },
+}
+
+/// Outcome of one bring-up pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BringUpReport {
+    pub session: String,
+    pub session_created: bool,
+    /// The pinga TUI window (created or found), when known.
+    pub pinga_window: Option<String>,
+    /// The resurrect service's status report, when it was asked (None when the
+    /// session already existed or systemctl is unavailable).
+    pub resurrect: Option<String>,
+    pub actions: Vec<RestoreAction>,
+}
+
+/// Default listing retry policy for boot: the opencode HTTP listener took
+/// ~10s to accept connections after `systemd` marked the unit started on the
+/// 2026-10-04 reboot, so bring-up must out-wait it (15 x 2s = 30s).
+pub const LIST_RETRIES: u32 = 15;
+pub const LIST_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Full bring-up: ensure the tmux session + pinga TUI window, then reconcile
+/// every tracked record against live evidence.
+pub fn bring_up(
+    launcher: &Launcher,
+    providers: &ProviderRegistry,
+    store: &dyn TrackingStore,
+    exe: &Path,
+    session: &str,
+) -> Result<BringUpReport> {
+    let (session_created, pinga_window, resurrect) = ensure_session(launcher, exe, session)?;
+    let records = store.read()?;
+    let actions = reconcile(launcher, providers, store, &records, session,
+                            LIST_RETRIES, LIST_RETRY_DELAY)?;
+    // The console is pinga itself: it always ends up the FIRST window of the
+    // session (best-effort; a restored layout may leave it elsewhere).
+    if let Some(win) = &pinga_window {
+        let _ = launcher.move_window_to_front(win, session);
+    }
+    Ok(BringUpReport { session: session.into(), session_created, pinga_window,
+                       resurrect, actions })
+}
+
+/// The TUI window command: POSIX `sh -c "exec '<exe>'"`, so process inspection
+/// sees the real pinga binary (the same convention as every other window).
+fn tui_command(exe: &Path) -> Result<Vec<String>> {
+    let req = LaunchRequest {
+        program: exe.to_string_lossy().into_owned(),
+        args: vec![], cwd: None, env: vec![],
+    };
+    let cmd = serialize_launch(&req)?;
+    Ok(vec!["sh".into(), "-c".into(), cmd])
+}
+
+/// Ensure the session exists and that the pinga TUI window is actually running
+/// in it. Returns (session_created, pinga_window_id_if_known, resurrect_report).
+fn ensure_session(launcher: &Launcher, exe: &Path, session: &str)
+    -> Result<(bool, Option<String>, Option<String>)> {
+    let argv = tui_command(exe)?;
+    if !launcher.has_session(session)? {
+        // No session: ask the systemd boot-restore service to run the resurrect
+        // FIRST (it may restore the whole pre-reboot layout, the user's
+        // requirement). The service reports back via its status file; only when
+        // it fails (or is unavailable) does pinga create its own session — the
+        // fallback path.
+        let resurrect = launcher.request_resurrect();
+        if launcher.has_session(session)? {
+            // The resurrect (or anything else) brought the session up. It does
+            // NOT bring the console back (resurrect replays shells, not TUIs),
+            // so fall through to the TUI check below — a restored session must
+            // still get its console (2026-10-04: the early return here left
+            // drills with NO console at all).
+            return ensure_tui_window(launcher, exe, session, resurrect);
+        }
+        let win = launcher.new_session(session, PINGA_WINDOW_LABEL, &argv)?;
+        return Ok((true, Some(win), resurrect));
+    }
+    ensure_tui_window(launcher, exe, session, None)
+}
+
+/// Verify by argv that the pinga TUI window is actually running in the session
+/// (a pane whose shell was saved empty by resurrect does not count), creating
+/// it when missing. Returns (false, console_window_id, resurrect_report).
+fn ensure_tui_window(launcher: &Launcher, exe: &Path, session: &str,
+                     resurrect: Option<String>)
+    -> Result<(bool, Option<String>, Option<String>)> {
+    let evidence = launcher.collect_evidence_in(session, &[])?;
+    let found = evidence.windows.iter().find(|w| w.procs.iter().any(
+        |p| argv_is_pinga(&p.argv, exe)));
+    if let Some(w) = found {
+        return Ok((false, Some(w.window_id.clone()), resurrect));
+    }
+    let req = LaunchRequest {
+        program: exe.to_string_lossy().into_owned(),
+        args: vec![], cwd: None, env: vec![],
+    };
+    let win = launcher.open_in_tmux_in(session, PINGA_WINDOW_LABEL, &req)?;
+    Ok((false, Some(win), resurrect))
+}
+
+/// Find a pinga console ALREADY running in the given tmux session, excluding
+/// the current process. One console per session: the entrypoint refuses a
+/// second instance and points at the running one. A partial scan (incomplete
+/// evidence) never refuses — a duplicate console is benign (cooperative
+/// store), a false refusal is not.
+pub fn other_tui_in(launcher: &Launcher, session: &str, exe: &Path)
+    -> Result<Option<(String, u64)>> {
+    let evidence = launcher.collect_evidence_in(session, &[])?;
+    let me = u64::from(std::process::id());
+    for w in &evidence.windows {
+        for p in &w.procs {
+            if p.pid != me && argv_is_pinga(&p.argv, exe) {
+                return Ok(Some((w.window_id.clone(), p.pid)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether an argv belongs to the pinga binary. The boot TUI window runs
+/// `sh -c "exec '<exe>'"`, so its argv[0] is the full canonical path; a
+/// console started by hand from a shell typically carries the bare name or a
+/// relative path (`pinga`, `./pinga`). Match either — the same basename
+/// convention the provider adapters use for their executables.
+fn argv_is_pinga(argv: &[String], exe: &Path) -> bool {
+    let Some(first) = argv.first() else { return false };
+    if first == exe.to_str().unwrap_or("") { return true; }
+    Path::new(first).file_name() == exe.file_name()
+}
+
+/// Outcome of the one-console-per-session guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleGuard {
+    /// The window id the other console runs in (same session).
+    pub window: String,
+    /// The window's `index:name` label as tmux shows it (best-effort; None when
+    /// tmux could not report it, e.g. the window died mid-scan).
+    pub label: Option<String>,
+    /// Whether the user was switched to it (best-effort; the window may have
+    /// died between the scan and the select).
+    pub switched: bool,
+}
+
+/// The guard the entrypoint runs inside tmux: when another pinga console is
+/// already running in this session, redirect the user to it (D8-style select)
+/// instead of starting a second one. `None` means the console is free.
+pub fn guard_console(launcher: &Launcher, session: &str, exe: &Path)
+    -> Result<Option<ConsoleGuard>> {
+    let Some((window, _pid)) = other_tui_in(launcher, session, exe)? else {
+        return Ok(None);
+    };
+    let label = launcher.window_label(&window).ok();
+    let switched = launcher.select_window(&window).is_ok();
+    Ok(Some(ConsoleGuard { window, label, switched }))
+}
+
+/// Reconcile every tracked record against live evidence. `list_retries` and
+/// `list_retry_delay` control the per-provider listing retry (0 = no retry,
+/// which the tests use).
+fn reconcile(
+    launcher: &Launcher,
+    providers: &ProviderRegistry,
+    store: &dyn TrackingStore,
+    records: &[TrackedRecord],
+    session: &str,
+    list_retries: u32,
+    list_retry_delay: Duration,
+) -> Result<Vec<RestoreAction>> {
+    let mut actions = Vec::new();
+    // Records created before identity capture (or migrated from legacy) have
+    // no restore identity; backfill it from the live window, best-effort, so
+    // the NEXT reboot can restore them in place. A dead window is skipped.
+    for rec in records.iter() {
+        if !rec.window_identity().map(|(i, n)| i.is_none() && n.is_none()).unwrap_or(false) {
+            continue;
+        }
+        if !launcher.window_alive(rec.window()).unwrap_or(false) { continue; }
+        if let Ok((index, name)) = launcher.window_index_name(rec.window()) {
+            store.update(&mut |recs| {
+                let mut changed = false;
+                for r in recs.iter_mut() {
+                    if r.record_id() == rec.record_id() {
+                        changed |= r.set_window_identity(rec.window(), Some(index), Some(name.clone()));
+                    }
+                }
+                changed
+            })?;
+        }
+    }
+    let tracked: Vec<String> = records.iter().map(|r| r.window().to_string()).collect();
+    let evidence = launcher.collect_evidence_in(session, &tracked)?;
+    // Listing is cached per provider so one failure defers every record of it.
+    let mut listings: HashMap<crate::model::ProviderId, Result<Vec<Session>>> = HashMap::new();
+    for rec in records {
+        let id = rec.record_id();
+        let TrackedRecord::Known { provider, session: native, state, .. } = rec else {
+            actions.push(RestoreAction::Deferred { record_id: id,
+                reason: "not a known tracked session".into() });
+            continue;
+        };
+        if *state != TrackedState::Open {
+            actions.push(RestoreAction::Deferred { record_id: id, reason: "not open".into() });
+            continue;
+        }
+        let Some(prov) = providers.get(provider) else {
+            actions.push(RestoreAction::Deferred { record_id: id,
+                reason: format!("provider {provider} is not configured") });
+            continue;
+        };
+        let listing = listings.entry(provider.clone()).or_insert_with(|| {
+            listing_with_retry(prov, list_retries, list_retry_delay)
+        });
+        let Ok(snapshot) = listing else {
+            let e = listing.as_ref().unwrap_err();
+            actions.push(RestoreAction::Deferred { record_id: id,
+                reason: format!("listing failed: {e}") });
+            continue;
+        };
+        // The record's native id must still exist in the authoritative listing.
+        let Some(s) = snapshot.iter().find(|s| s.id == *native && &s.provider_id == provider)
+            else {
+                actions.push(RestoreAction::Deferred { record_id: id,
+                    reason: "session gone from listing".into() });
+                continue;
+            };
+        let matches = prov.match_session(s, snapshot, &evidence);
+        let confirmed: Vec<&WindowMatch> = matches.iter()
+            .filter(|m| m.confidence == MatchConfidence::Confirmed).collect();
+        match confirmed.len() {
+            1 => {
+                let win = confirmed[0].window_id.clone();
+                repair_window(launcher, store, id, &win)?;
+                actions.push(RestoreAction::Adopted { record_id: id, window: win });
+            }
+            0 => {
+                if !evidence.complete {
+                    // Nothing positively confirmed AND the scan was partial: we
+                    // cannot even report it reliably — defer without touching it.
+                    actions.push(RestoreAction::Deferred { record_id: id,
+                        reason: "evidence incomplete; left untouched".into() });
+                    continue;
+                }
+                // Not running anywhere. Restart it in the window it was in
+                // before interruption (the user's explicit requirement):
+                // resurrect replays windows by name/order but reassigns ids,
+                // so the record's stored identity finds the successor window.
+                // Only an idle shell pane is ever replaced; a busy window is
+                // left alone, and with no identity/candidate the session stays
+                // in the console's list for the user to relaunch.
+                match restore_into_window(launcher, store, prov, s, session, rec, id, &evidence)? {
+                    Some(action) => actions.push(action),
+                    None => actions.push(RestoreAction::NotRunning { record_id: id }),
+                }
+            }
+            _ => actions.push(RestoreAction::Deferred { record_id: id,
+                reason: "ambiguous identity (multiple windows claim this session)".into() }),
+        }
+    }
+    Ok(actions)
+}
+
+/// Restart a tracked session inside the window it ran in before interruption.
+/// Returns `Some` when the case was resolved (restored or explicitly refused);
+/// `None` when there is nothing to restore into (no identity, no matching
+/// window) — the caller then reports the session as not running.
+#[allow(clippy::too_many_arguments)]
+fn restore_into_window(
+    launcher: &Launcher,
+    store: &dyn TrackingStore,
+    prov: &dyn Provider,
+    s: &Session,
+    session: &str,
+    rec: &TrackedRecord,
+    record_id: u64,
+    evidence: &crate::model::ProcessEvidence,
+) -> Result<Option<RestoreAction>> {
+    let Some((want_index, want_name)) = rec.window_identity() else {
+        return Ok(None);
+    };
+    if want_index.is_none() && want_name.is_none() {
+        // No identity at all: nothing to restore into (a backfilled identity
+        // applies from the NEXT bring-up). The console's list is the path.
+        return Ok(None);
+    }
+    let wins = launcher.session_windows(session)?;
+    // A NAME match is strong identity; an INDEX-only match is weak (a fresh
+    // session can renumber everything — e.g. the console takes index 1 with
+    // base-index 1). Prefer the name, fall back to the index.
+    let by_name = wins.iter().find(|(_, _, name)| Some(name.as_str()) == want_name);
+    let by_index = wins.iter().find(|(_, index, _)| Some(*index) == want_index);
+    let candidate = by_name.or(by_index);
+    if let Some((win, _, _)) = candidate {
+        // The window survived (e.g. resurrect restored it): replace the idle
+        // shell pane in place. Only an IDLE shell is ever replaced — respawn
+        // kills whatever runs there, and a busy window (the user's own work)
+        // is never killed by bring-up.
+        let idle = evidence.windows.iter().find(|w| &w.window_id == win)
+            .map(|w| w.procs.len() == 1 && is_idle_shell(&w.procs[0].argv))
+            .unwrap_or(false);
+        if idle {
+            let plan = prov.resume_plan(s).map_err(|e| {
+                anyhow!("resume unsupported for {}: {e}", s.id)
+            })?;
+            let cmd = serialize_launch(&plan)?;
+            launcher.respawn_pane(win, &["sh".into(), "-c".into(), cmd])?;
+            repair_window(launcher, store, record_id, win)?;
+            return Ok(Some(RestoreAction::Restored { record_id, window: win.clone() }));
+        }
+        if by_name.is_some() {
+            // The session's OWN window exists but is busy — never kill it.
+            return Ok(Some(RestoreAction::Deferred { record_id,
+                reason: format!("window {win} is not an idle shell; left untouched") }));
+        }
+        // INDEX-only match on a busy window is not our session (a live client
+        // would have been adopted earlier): fall through and recreate the
+        // window with the recorded name (2026-10-04: a fresh session's console
+        // can occupy the recorded index and the session would stay dead
+        // forever otherwise).
+    }
+    // The window is GONE (resurrect restored nothing — observed on the
+    // 2026-10-04 reboot): recreate it with the recorded name and start the
+    // session in it. The position is not preserved without resurrect.
+    let label = want_name
+        .map(|n| n.chars().take(24).collect::<String>())
+        .unwrap_or_else(|| s.display_title().chars().take(24).collect::<String>());
+    let plan = prov.resume_plan(s).map_err(|e| {
+        anyhow!("resume unsupported for {}: {e}", s.id)
+    })?;
+    let win = launcher.open_in_tmux_in(session, &label, &plan)?;
+    repair_window(launcher, store, record_id, &win)?;
+    Ok(Some(RestoreAction::Restored { record_id, window: win }))
+}
+
+/// A single process whose argv[0] is a shell basename: the pane is an idle
+/// shell (the resurrect-restored state), safe to respawn. Anything else —
+/// nested commands, a client, multiple processes — is busy.
+fn is_idle_shell(argv: &[String]) -> bool {
+    let Some(first) = argv.first() else { return false };
+    let Some(name) = Path::new(first).file_name() else { return false };
+    matches!(name.to_str(), Some("sh" | "bash" | "dash" | "zsh" | "ksh" | "fish"))
+}
+
+/// Re-point a record's window id (stale after a tmux-resurrect restore, where
+/// ids are reassigned) and refresh its restore identity from the live window
+/// (best-effort; tmux failure leaves the identity as-is). No-op when unchanged.
+fn repair_window(launcher: &Launcher, store: &dyn TrackingStore,
+                 record_id: u64, window: &str) -> Result<()> {
+    let identity = launcher.window_index_name(window)
+        .map(|(i, n)| (Some(i), Some(n))).unwrap_or((None, None));
+    store.update(&mut |recs| {
+        let mut changed = false;
+        for r in recs.iter_mut() {
+            if r.record_id() == record_id {
+                changed |= r.set_window_identity(window, identity.0, identity.1.clone());
+            }
+        }
+        changed
+    })?;
+    Ok(())
+}
+
+/// A provider listing with retry, for boot races on the HTTP listener.
+fn listing_with_retry(prov: &dyn Provider, retries: u32, delay: Duration)
+    -> Result<Vec<Session>> {
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 0..=retries {
+        match prov.list() {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last = Some(e);
+                if attempt < retries { std::thread::sleep(delay); }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("listing failed")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::launcher::{ProcReader, ProcTree, Tmux};
+    use crate::model::{ProcEvidence, ProcessEvidence, ProviderId};
+    use crate::provider::{NewSessionCapability, ProviderCapabilities, ProviderDescriptor};
+    use crate::tracking::MemStore;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn exe() -> PathBuf { PathBuf::from("/home/u/bin/pinga") }
+
+    fn zero() -> Duration { Duration::ZERO }
+
+    struct FakeProc { trees: HashMap<u64, ProcTree> }
+    impl ProcReader for FakeProc {
+        fn tree(&self, root: u64, _max: u32) -> ProcTree {
+            self.trees.get(&root).cloned().unwrap_or(ProcTree { procs: vec![], complete: true })
+        }
+    }
+
+    struct FakeTmux {
+        sessions: Arc<Mutex<HashMap<String, Vec<String>>>>,
+        identities: HashMap<String, (u64, String)>,
+        panes: HashMap<String, Vec<u64>>,
+        next_win: AtomicUsize,
+        created: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+        sessions_created: Arc<Mutex<Vec<(String, String, Vec<String>)>>>,
+        attached: Arc<Mutex<Vec<String>>>,
+        selected: Arc<Mutex<Vec<String>>>,
+        respawned: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+        moved_to_front: Arc<Mutex<Vec<String>>>,
+    }
+    impl FakeTmux {
+        fn new(session: Option<(&str, Vec<&str>)>) -> Self {
+            let sessions = Arc::new(Mutex::new(match session {
+                Some((name, wins)) => HashMap::from([(name.to_string(),
+                    wins.iter().map(|w| w.to_string()).collect())]),
+                None => HashMap::new(),
+            }));
+            Self { sessions, identities: HashMap::new(), panes: HashMap::new(),
+                   next_win: AtomicUsize::new(100),
+                   created: Arc::new(Mutex::new(Vec::new())),
+                   sessions_created: Arc::new(Mutex::new(Vec::new())),
+                   attached: Arc::new(Mutex::new(Vec::new())),
+                   selected: Arc::new(Mutex::new(Vec::new())),
+                   respawned: Arc::new(Mutex::new(Vec::new())),
+                   moved_to_front: Arc::new(Mutex::new(Vec::new())) }
+        }
+        fn with_panes(mut self, panes: HashMap<String, Vec<u64>>) -> Self {
+            self.panes = panes; self
+        }
+        fn with_identities(mut self, identities: HashMap<String, (u64, String)>) -> Self {
+            self.identities = identities; self
+        }
+        fn created(&self) -> Vec<(String, Vec<String>)> { self.created.lock().unwrap().clone() }
+        fn sessions_created(&self) -> Vec<(String, String, Vec<String>)> {
+            self.sessions_created.lock().unwrap().clone()
+        }
+        fn attached(&self) -> Vec<String> { self.attached.lock().unwrap().clone() }
+        fn selected(&self) -> Vec<String> { self.selected.lock().unwrap().clone() }
+        fn respawned(&self) -> Vec<(String, Vec<String>)> { self.respawned.lock().unwrap().clone() }
+        fn moved_to_front(&self) -> Vec<String> { self.moved_to_front.lock().unwrap().clone() }
+    }
+    impl Tmux for FakeTmux {
+        fn in_tmux(&self) -> bool { false }
+        fn current_session(&self) -> Result<String> { Ok("main".into()) }
+        fn new_window(&self, session: &str, label: &str, command: &[String]) -> Result<String> {
+            self.created.lock().unwrap().push((label.into(), command.to_vec()));
+            let n = self.next_win.fetch_add(1, Ordering::SeqCst);
+            self.sessions.lock().unwrap().get_mut(session)
+                .map(|w| w.push(format!("@{n}")));
+            Ok(format!("@{n}"))
+        }
+        fn select_window(&self, win: &str) -> Result<()> {
+            self.selected.lock().unwrap().push(win.into()); Ok(())
+        }
+        fn window_alive(&self, _win: &str) -> Result<bool> { Ok(true) }
+        fn mouse_on(&self) -> Result<bool> { Ok(true) }
+        fn list_window_ids(&self, _all: bool) -> Result<Vec<String>> {
+            Ok(self.sessions.lock().unwrap().values().flatten().cloned().collect())
+        }
+        fn pane_root_pids(&self, win: &str) -> Result<Vec<u64>> {
+            Ok(self.panes.get(win).cloned().unwrap_or_default())
+        }
+        fn has_session(&self, name: &str) -> Result<bool> {
+            Ok(self.sessions.lock().unwrap().contains_key(name))
+        }
+        fn new_session(&self, name: &str, label: &str, command: &[String]) -> Result<String> {
+            let n = self.next_win.fetch_add(1, Ordering::SeqCst);
+            self.sessions_created.lock().unwrap()
+                .push((name.into(), label.into(), command.to_vec()));
+            self.sessions.lock().unwrap()
+                .insert(name.into(), vec![format!("@{n}")]);
+            Ok(format!("@{n}"))
+        }
+        fn attach(&self, name: &str) -> Result<()> {
+            self.attached.lock().unwrap().push(name.into()); Ok(())
+        }
+        fn list_windows(&self, session: &str) -> Result<Vec<String>> {
+            Ok(self.sessions.lock().unwrap().get(session).cloned().unwrap_or_default())
+        }
+        fn window_label(&self, win: &str) -> Result<String> {
+            Ok(format!("1:{win}"))
+        }
+        fn window_index_name(&self, win: &str) -> Result<(u64, String)> {
+            // Only windows with a recorded identity answer; unknown windows
+            // (and dead ones) fail like a real tmux would, so the backfill
+            // never invents identities.
+            self.identities.get(win).cloned()
+                .ok_or_else(|| anyhow!("no identity for {win}"))
+        }
+        fn session_windows(&self, session: &str) -> Result<Vec<(String, u64, String)>> {
+            Ok(self.sessions.lock().unwrap().get(session).cloned().unwrap_or_default()
+                .iter().map(|w| {
+                    let (i, n) = self.identities.get(w).cloned().unwrap_or((0, "n".into()));
+                    (w.clone(), i, n)
+                }).collect())
+        }
+        fn respawn_pane(&self, win: &str, command: &[String]) -> Result<()> {
+            self.respawned.lock().unwrap().push((win.into(), command.to_vec()));
+            Ok(())
+        }
+        fn rename_window(&self, _win: &str, _label: &str) -> Result<()> { Ok(()) }
+        fn move_window_to_front(&self, _win: &str, _session: &str) -> Result<()> { Ok(()) }
+    }
+
+    /// Tests move the fake into the Launcher while still needing to read its
+    /// recorded calls afterwards, so the shared-ownership form also implements
+    /// the seam by pure delegation.
+    impl Tmux for Arc<FakeTmux> {
+        fn in_tmux(&self) -> bool { self.as_ref().in_tmux() }
+        fn current_session(&self) -> Result<String> { self.as_ref().current_session() }
+        fn new_window(&self, s: &str, l: &str, c: &[String]) -> Result<String> {
+            self.as_ref().new_window(s, l, c)
+        }
+        fn select_window(&self, w: &str) -> Result<()> { self.as_ref().select_window(w) }
+        fn window_alive(&self, w: &str) -> Result<bool> { self.as_ref().window_alive(w) }
+        fn mouse_on(&self) -> Result<bool> { self.as_ref().mouse_on() }
+        fn list_window_ids(&self, all: bool) -> Result<Vec<String>> {
+            self.as_ref().list_window_ids(all)
+        }
+        fn pane_root_pids(&self, w: &str) -> Result<Vec<u64>> { self.as_ref().pane_root_pids(w) }
+        fn has_session(&self, n: &str) -> Result<bool> { self.as_ref().has_session(n) }
+        fn new_session(&self, n: &str, l: &str, c: &[String]) -> Result<String> {
+            self.as_ref().new_session(n, l, c)
+        }
+        fn attach(&self, n: &str) -> Result<()> { self.as_ref().attach(n) }
+        fn list_windows(&self, s: &str) -> Result<Vec<String>> { self.as_ref().list_windows(s) }
+        fn window_label(&self, w: &str) -> Result<String> { self.as_ref().window_label(w) }
+        fn window_index_name(&self, w: &str) -> Result<(u64, String)> {
+            self.as_ref().window_index_name(w)
+        }
+        fn session_windows(&self, s: &str) -> Result<Vec<(String, u64, String)>> {
+            self.as_ref().session_windows(s)
+        }
+        fn respawn_pane(&self, w: &str, c: &[String]) -> Result<()> {
+            self.as_ref().respawn_pane(w, c)
+        }
+        fn rename_window(&self, w: &str, l: &str) -> Result<()> {
+            self.as_ref().rename_window(w, l)
+        }
+        fn move_window_to_front(&self, w: &str, s: &str) -> Result<()> {
+            self.as_ref().move_window_to_front(w, s)
+        }
+    }
+
+    struct FakeProvider {
+        id: &'static str,
+        sessions: Vec<Session>,
+        list_err: bool,
+    }
+    impl FakeProvider {
+        fn new(id: &'static str, sessions: Vec<Session>) -> Self {
+            Self { id, sessions, list_err: false }
+        }
+    }
+    impl Provider for FakeProvider {
+        fn descriptor(&self) -> ProviderDescriptor {
+            ProviderDescriptor { id: ProviderId::new(self.id).expect("id"),
+                                 type_key: "fake", display_name: self.id.into() }
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities { rename: false, resume: true,
+                new_session: NewSessionCapability {
+                    supported: false, applies_title: false, applies_cwd: false } }
+        }
+        fn list(&self) -> Result<Vec<Session>> {
+            if self.list_err { Err(anyhow!("server down")) } else { Ok(self.sessions.clone()) }
+        }
+        fn resume_plan(&self, s: &Session) -> Result<LaunchRequest> {
+            Ok(LaunchRequest { program: "attach".into(), args: vec![s.id.clone()],
+                               cwd: None, env: vec![] })
+        }
+        fn match_session(&self, s: &Session, _snap: &[Session], ev: &ProcessEvidence) -> Vec<WindowMatch> {
+            ev.windows.iter()
+                .filter(|w| w.procs.iter().any(|p| p.argv.iter().any(|a| a == &s.id)))
+                .map(|w| WindowMatch { window_id: w.window_id.clone(),
+                                       confidence: MatchConfidence::Confirmed })
+                .collect()
+        }
+    }
+
+    fn session(id: &'static str) -> Session {
+        Session { provider_id: ProviderId::new("fake").expect("id"), id: id.into(),
+                  title: None, slug: None, directory: None, session_id: None,
+                  agent: None, model: None, created_ms: None, updated_ms: None, active: false }
+    }
+
+    fn known(id: u64, native: &str, window: &str) -> TrackedRecord {
+        TrackedRecord::Known { id, provider: ProviderId::new("fake").expect("id"),
+                               session: native.into(), window: window.into(),
+                               window_index: None, window_name: None,
+                               aliases: vec![], state: TrackedState::Open }
+    }
+
+    fn known_with_identity(id: u64, native: &str, window: &str,
+                           index: u64, name: &str) -> TrackedRecord {
+        TrackedRecord::Known { id, provider: ProviderId::new("fake").expect("id"),
+                               session: native.into(), window: window.into(),
+                               window_index: Some(index), window_name: Some(name.into()),
+                               aliases: vec![], state: TrackedState::Open }
+    }
+
+    fn launcher_with(tmux: Arc<FakeTmux>, trees: HashMap<u64, ProcTree>) -> Launcher {
+        Launcher::with_seams(Box::new(FakeProc { trees }), Box::new(tmux),
+                             Box::new(crate::launcher::StdioRunner))
+    }
+
+    fn registry(prov: FakeProvider) -> ProviderRegistry {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Box::new(prov)).expect("register");
+        reg
+    }
+
+    fn procs(pid: u64, argv: Vec<&str>) -> (u64, ProcTree) {
+        (pid, ProcTree { procs: vec![ProcEvidence { pid, argv: argv.iter().map(|s| s.to_string()).collect(),
+                                                   env: vec![] }], complete: true })
+    }
+
+    #[test]
+    fn missing_session_asks_resurrect_first_and_falls_back() {
+        // The user's requirement: with no session, pinga must ask the systemd
+        // restore service first and act on its report — only if that fails
+        // does it create its own session.
+        let resurrected = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&resurrected);
+        let tmux = Arc::new(FakeTmux::new(None));
+        let sessions = Arc::clone(&tmux.sessions);
+        struct Ask(Arc<AtomicUsize>);
+        impl crate::launcher::Resurrect for Ask {
+            fn request(&self) -> Option<String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Some("FAIL nothing restored".into())
+            }
+        }
+        let l = launcher_with(Arc::clone(&tmux), HashMap::new())
+            .with_resurrect(Box::new(Ask(probe)));
+        let (created, win, resurrect) = ensure_session(&l, &exe(), "main").unwrap();
+        assert_eq!(resurrected.load(Ordering::SeqCst), 1, "resurrect was asked first");
+        assert_eq!(resurrect.as_deref(), Some("FAIL nothing restored"));
+        assert!(created, "pinga falls back to creating its own session");
+        assert_eq!(win.as_deref(), Some("@100"));
+        let _ = sessions;
+    }
+
+    #[test]
+    fn bring_up_moves_the_console_to_the_first_window() {
+        // pinga is the console: after bring-up it must be the session's FIRST
+        // window, even when restored/recreated windows exist around it.
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@0"])))
+            .with_identities(HashMap::from([("@0".into(), (0, "pinga".into()))]))
+            .with_panes(HashMap::from([("@0".into(), vec![50])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["sh"])]));
+        let store = MemStore::new(vec![known_with_identity(1, "ses_x", "@77", 1, "markdown")]);
+        let prov = FakeProvider::new("fake", vec![session("ses_x")]);
+        let report = bring_up(&l, &registry(prov), &store, &exe(), "main").unwrap();
+        assert_eq!(report.pinga_window.as_deref(), Some("@100"),
+            "console created (no TUI found)");
+        assert_eq!(tmux.moved_to_front(), vec!["@100".to_string()],
+            "the console is moved to the front after bring-up");
+    }
+
+    #[test]
+    fn missing_session_is_created_with_a_detached_tui_window() {
+        let tmux = Arc::new(FakeTmux::new(None));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::new());
+        let (created, win, _resurrect) = ensure_session(&l, &exe(), "main").unwrap();
+        assert!(created);
+        assert_eq!(win.as_deref(), Some("@100"));
+        let sess = tmux.sessions_created();
+        assert_eq!(sess.len(), 1);
+        assert_eq!(sess[0].0, "main");
+        assert_eq!(sess[0].1, PINGA_WINDOW_LABEL);
+        assert_eq!(sess[0].2[0], "sh");
+        assert_eq!(sess[0].2[1], "-c");
+        assert!(sess[0].2[2].contains("exec '/home/u/bin/pinga'"),
+            "TUI window must exec the pinga binary: {}", sess[0].2[2]);
+    }
+
+    #[test]
+    fn existing_session_without_a_running_tui_gets_one_created() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_panes(HashMap::from([("@1".into(), vec![50])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["sh"])]));
+        let (created, win, _resurrect) = ensure_session(&l, &exe(), "main").unwrap();
+        assert!(!created, "session existed");
+        assert_eq!(win.as_deref(), Some("@100"), "a pinga window was created");
+        let created_windows = tmux.created();
+        assert_eq!(created_windows.len(), 1);
+        assert_eq!(created_windows[0].0, PINGA_WINDOW_LABEL);
+        assert!(created_windows[0].1[2].contains("exec '/home/u/bin/pinga'"));
+    }
+
+    #[test]
+    fn existing_session_with_running_tui_is_left_alone() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_panes(HashMap::from([("@1".into(), vec![50])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["/home/u/bin/pinga"])]));
+        let (created, win, _resurrect) = ensure_session(&l, &exe(), "main").unwrap();
+        assert!(!created);
+        assert_eq!(win, None, "TUI already running; nothing created");
+        assert!(tmux.created().is_empty());
+    }
+
+    #[test]
+    fn confirmed_window_is_adopted_and_stale_record_repaired() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_panes(HashMap::from([("@1".into(), vec![100])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(100, vec!["attach", "ses_x"])]));
+        let store = MemStore::new(vec![known(1, "ses_x", "@77")]); // stale window id
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_x")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        assert_eq!(actions, vec![RestoreAction::Adopted { record_id: 1, window: "@1".into() }]);
+        assert_eq!(store.read().unwrap()[0].window(), "@1", "stale id repaired");
+        assert!(tmux.created().is_empty(), "nothing launched");
+    }
+
+    #[test]
+    fn missing_session_is_reported_not_running_and_never_launched() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_panes(HashMap::from([("@1".into(), vec![200])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(200, vec!["sh"])]));
+        let store = MemStore::new(vec![known(1, "ses_y", "@2")]);
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_y")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        // Bring-up never auto-launches: the session is reported, the record is
+        // untouched, and the user relaunches it from the console's list.
+        assert_eq!(actions, vec![RestoreAction::NotRunning { record_id: 1 }]);
+        assert!(tmux.created().is_empty(), "no window may be launched");
+        assert!(tmux.respawned().is_empty(), "nothing respawned without identity");
+        assert_eq!(store.read().unwrap()[0].window(), "@2", "record untouched");
+    }
+
+    #[test]
+    fn session_is_restarted_into_its_original_window() {
+        // The pre-reboot record points at window index 1 "markdown". After a
+        // resurrect restore the window exists again (as an idle shell) under a
+        // NEW id; bring-up must respawn the session inside THAT window.
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1", "@9"])))
+            .with_identities(HashMap::from([("@1".into(), (1, "markdown".into())),
+                                            ("@9".into(), (2, "other".into()))]))
+            .with_panes(HashMap::from([("@1".into(), vec![50])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["bash"])]));
+        let store = MemStore::new(vec![known_with_identity(1, "ses_x", "@77", 1, "markdown")]);
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_x")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        assert_eq!(actions, vec![RestoreAction::Restored { record_id: 1, window: "@1".into() }]);
+        let respawned = tmux.respawned();
+        assert_eq!(respawned.len(), 1);
+        assert_eq!(respawned[0].0, "@1");
+        assert_eq!(respawned[0].1[0], "sh");
+        assert_eq!(respawned[0].1[1], "-c");
+        assert!(respawned[0].1[2].contains("exec 'attach' 'ses_x'"),
+            "resume plan serialized into the restored window: {}", respawned[0].1[2]);
+        assert_eq!(store.read().unwrap()[0].window(), "@1", "record re-pointed");
+        assert_eq!(store.read().unwrap()[0].window_identity(),
+                   Some((Some(1), Some("markdown"))), "identity refreshed");
+    }
+
+    #[test]
+    fn busy_window_is_never_respawned() {
+        // The original window now runs something else (a busy pane): bring-up
+        // must refuse, never kill the user's work.
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_identities(HashMap::from([("@1".into(), (1, "markdown".into()))]))
+            .with_panes(HashMap::from([("@1".into(), vec![50])])));
+        let busy = ProcTree { procs: vec![
+            ProcEvidence { pid: 50, argv: vec!["bash".into()], env: vec![] },
+            ProcEvidence { pid: 51, argv: vec!["vim".into()], env: vec![] },
+        ], complete: true };
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([(50, busy)]));
+        let store = MemStore::new(vec![known_with_identity(1, "ses_x", "@77", 1, "markdown")]);
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_x")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        assert!(matches!(&actions[0], RestoreAction::Deferred { record_id: 1, reason }
+            if reason.contains("idle shell")), "{:?}", actions[0]);
+        assert!(tmux.respawned().is_empty(), "busy window is never respawned");
+        assert_eq!(store.read().unwrap()[0].window(), "@77", "record untouched");
+    }
+
+    #[test]
+    fn index_collision_with_a_busy_console_falls_back_to_recreation() {
+        // A fresh session's console can occupy the recorded index (base-index
+        // 1 => index 1) while the session's own window is gone. An index-only
+        // match on a busy window must NOT defer forever — the window is not
+        // ours (a live client would have been adopted) — it falls through to
+        // recreating the window with the recorded name.
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@0"])))
+            .with_identities(HashMap::from([("@0".into(), (1, "pinga".into()))]))
+            .with_panes(HashMap::from([("@0".into(), vec![50])])));
+        let busy = ProcTree { procs: vec![
+            ProcEvidence { pid: 50, argv: vec!["/home/u/bin/pinga".into()], env: vec![] },
+        ], complete: true };
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([(50, busy)]));
+        let store = MemStore::new(vec![known_with_identity(1, "ses_x", "@77", 1, "markdown")]);
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_x")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        assert_eq!(actions, vec![RestoreAction::Restored { record_id: 1, window: "@100".into() }],
+            "{:?}", actions);
+        let created = tmux.created();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, "markdown", "window recreated with its recorded name");
+        assert!(tmux.respawned().is_empty(), "the busy console is never respawned");
+        assert_eq!(store.read().unwrap()[0].window(), "@100");
+    }
+
+    #[test]
+    fn missing_identity_is_backfilled_from_the_live_window() {
+        // Records written before identity capture (or migrated from legacy)
+        // gain their restore identity from the still-live window, so the NEXT
+        // reboot can restore them in place.
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@5"])))
+            .with_identities(HashMap::from([("@5".into(), (2, "pinga".into()))]))
+            .with_panes(HashMap::from([("@5".into(), vec![50])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["sh"])]));
+        let store = MemStore::new(vec![known(1, "ses_a", "@5")]);
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_a")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        // The backfilled identity applies from the NEXT bring-up; this run
+        // simply reports the session as not running.
+        assert!(matches!(&actions[0], RestoreAction::NotRunning { record_id: 1 }),
+            "{:?}", actions[0]);
+        assert_eq!(store.read().unwrap()[0].window_identity(),
+                   Some((Some(2), Some("pinga"))), "identity backfilled");
+    }
+
+    #[test]
+    fn vanished_window_is_recreated_with_the_recorded_name() {
+        // Resurrect restored NOTHING (observed at the 2026-10-04 boot): the
+        // recorded window does not exist in the session. Bring-up must
+        // recreate it with the recorded name and start the session in it —
+        // tracked sessions come back even without resurrect.
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@0"])))
+            .with_identities(HashMap::from([("@0".into(), (0, "pinga".into()))]))
+            .with_panes(HashMap::from([("@0".into(), vec![50])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["pinga"])]));
+        let store = MemStore::new(vec![known_with_identity(1, "ses_x", "@77", 1, "markdown")]);
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_x")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        assert_eq!(actions, vec![RestoreAction::Restored { record_id: 1, window: "@100".into() }]);
+        let created = tmux.created();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, "markdown", "window recreated with its recorded name");
+        assert!(created[0].1[2].contains("exec 'attach' 'ses_x'"),
+            "session started inside the recreated window: {}", created[0].1[2]);
+        assert_eq!(store.read().unwrap()[0].window(), "@100", "record re-pointed");
+    }
+
+    #[test]
+    fn idle_shell_detection_covers_common_shells() {
+        for shell in ["sh", "bash", "dash", "zsh", "ksh", "fish", "/usr/bin/bash"] {
+            assert!(is_idle_shell(&[shell.to_string()]), "{shell} is an idle shell");
+        }
+        assert!(!is_idle_shell(&["vim".to_string()]));
+        assert!(!is_idle_shell(&["pinga".to_string()]));
+        assert!(!is_idle_shell(&[]));
+        assert!(!is_idle_shell(&["opencode".to_string(), "attach".to_string()]));
+    }
+
+    #[test]
+    fn listing_failure_defers_every_record_of_that_provider() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"]))));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::new());
+        let store = MemStore::new(vec![known(1, "ses_x", "@1")]);
+        let recs = store.read().unwrap();
+        let mut prov = FakeProvider::new("fake", vec![session("ses_x")]);
+        prov.list_err = true;
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        match &actions[0] {
+            RestoreAction::Deferred { record_id: 1, reason } => {
+                assert!(reason.contains("listing failed"), "reason: {reason}");
+            }
+            other => panic!("expected deferred, got {other:?}"),
+        }
+        assert!(tmux.created().is_empty(), "never launch against a failed listing");
+    }
+
+    #[test]
+    fn incomplete_evidence_defers_even_when_session_is_present() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_panes(HashMap::from([("@1".into(), vec![200])])));
+        let mut tree = procs(200, vec!["sh"]);
+        tree.1.complete = false;
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([tree]));
+        let store = MemStore::new(vec![known(1, "ses_y", "@2")]);
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_y")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        assert!(matches!(&actions[0], RestoreAction::Deferred { record_id: 1, .. }),
+            "{:?}", actions[0]);
+        assert!(tmux.created().is_empty(), "no blind launch on incomplete evidence");
+    }
+
+    #[test]
+    fn ambiguous_identity_defers_and_launches_nothing() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1", "@2"])))
+            .with_panes(HashMap::from([
+                ("@1".into(), vec![100]), ("@2".into(), vec![200])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([
+            procs(100, vec!["attach", "ses_z"]), procs(200, vec!["attach", "ses_z"])]));
+        let store = MemStore::new(vec![known(1, "ses_z", "@1")]);
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_z")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        assert!(matches!(&actions[0], RestoreAction::Deferred { record_id: 1, reason }
+            if reason.contains("ambiguous")), "{:?}", actions[0]);
+        assert!(tmux.created().is_empty());
+    }
+
+    #[test]
+    fn session_gone_from_listing_is_deferred() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"]))));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::new());
+        let store = MemStore::new(vec![known(1, "ses_gone", "@1")]);
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_other")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        assert!(matches!(&actions[0], RestoreAction::Deferred { record_id: 1, reason }
+            if reason.contains("gone from listing")), "{:?}", actions[0]);
+        assert!(tmux.created().is_empty());
+    }
+
+    #[test]
+    fn pending_and_closed_records_are_deferred_untouched() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"]))));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::new());
+        let closed = TrackedRecord::Known { id: 1, provider: ProviderId::new("fake").unwrap(),
+            session: "ses_a".into(), window: "@1".into(),
+            window_index: None, window_name: None, state: TrackedState::Interrupted, aliases: vec![] };
+        let pending = TrackedRecord::Pending { id: 2, provider: ProviderId::new("fake").unwrap(),
+            window: "@9".into(), label: "new".into() };
+        let store = MemStore::new(vec![closed, pending]);
+        let recs = store.read().unwrap();
+        let prov = FakeProvider::new("fake", vec![session("ses_a")]);
+        let actions = reconcile(&l, &registry(prov), &store, &recs, "main", 0, zero()).unwrap();
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|a| matches!(a, RestoreAction::Deferred { .. })));
+        assert!(tmux.created().is_empty());
+        assert_eq!(store.read().unwrap().len(), 2, "records untouched");
+    }
+
+    #[test]
+    fn bring_up_end_to_end_creates_session_and_reconciles() {
+        let tmux = Arc::new(FakeTmux::new(None)
+            .with_panes(HashMap::from([("@100".into(), vec![50])])));
+        let trees: HashMap<u64, ProcTree> = HashMap::from([procs(50, vec!["/home/u/bin/pinga"])]);
+        let l = launcher_with(Arc::clone(&tmux), trees);
+        let store = MemStore::new(vec![known(1, "ses_a", "@5")]);
+        let prov = FakeProvider::new("fake", vec![session("ses_a")]);
+        let report = bring_up(&l, &registry(prov), &store, &exe(), "main").unwrap();
+        assert!(report.session_created);
+        assert_eq!(report.pinga_window.as_deref(), Some("@100"));
+        // The session is created with the TUI window; the tracked session is
+        // reported as not running — never auto-launched.
+        assert_eq!(report.actions.len(), 1);
+        assert!(matches!(&report.actions[0], RestoreAction::NotRunning { record_id: 1 }));
+        assert!(tmux.created().is_empty());
+    }
+
+    #[test]
+    fn no_arg_attach_is_a_separate_launcher_call() {
+        // The launcher's attach passthrough records its target session.
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"]))));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::new());
+        l.attach("main").unwrap();
+        assert_eq!(tmux.attached(), vec!["main"]);
+    }
+
+    #[test]
+    fn another_tui_in_the_session_is_found_and_reported() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_panes(HashMap::from([("@1".into(), vec![50])])));
+        let l = launcher_with(Arc::clone(&tmux),
+                              HashMap::from([procs(50, vec!["/home/u/bin/pinga"])]));
+        let found = other_tui_in(&l, "main", &exe()).unwrap();
+        assert_eq!(found, Some(("@1".into(), 50)), "another console is refused");
+    }
+
+    #[test]
+    fn manually_started_console_with_bare_argv0_is_still_detected() {
+        // A console started by typing `pinga` in a shell carries argv[0] = the
+        // bare name, not the canonical path. The guard must still find it.
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_panes(HashMap::from([("@1".into(), vec![50])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["pinga"])]));
+        let found = other_tui_in(&l, "main", &exe()).unwrap();
+        assert_eq!(found, Some(("@1".into(), 50)),
+            "bare argv0 must not defeat the guard");
+    }
+
+    #[test]
+    fn argv_is_pinga_matches_path_and_basename_but_not_other_binaries() {
+        let exe = PathBuf::from("/home/u/bin/pinga");
+        assert!(argv_is_pinga(&["/home/u/bin/pinga".into()], &exe), "canonical path");
+        assert!(argv_is_pinga(&["pinga".into()], &exe), "bare name from a shell");
+        assert!(argv_is_pinga(&["./pinga".into()], &exe), "relative invocation");
+        assert!(!argv_is_pinga(&["opencode".into()], &exe));
+        assert!(!argv_is_pinga(&["pinga-tmux-save".into()], &exe),
+            "similar-looking names do not match");
+        assert!(!argv_is_pinga(&[], &exe), "no argv at all");
+    }
+
+    #[test]
+    fn current_process_never_counts_as_another_tui() {
+        let me = u64::from(std::process::id());
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_panes(HashMap::from([("@1".into(), vec![me])])));
+        let l = launcher_with(Arc::clone(&tmux),
+                              HashMap::from([(me, ProcTree {
+                                  procs: vec![ProcEvidence { pid: me,
+                                      argv: vec!["/home/u/bin/pinga".into()], env: vec![] }],
+                                  complete: true })]));
+        let found = other_tui_in(&l, "main", &exe()).unwrap();
+        assert_eq!(found, None, "restart-in-place must not refuse itself");
+    }
+
+    #[test]
+    fn no_tui_anywhere_means_console_is_free() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_panes(HashMap::from([("@1".into(), vec![50])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["sh"])]));
+        let found = other_tui_in(&l, "main", &exe()).unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn second_console_is_redirected_to_the_running_window() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1", "@2"])))
+            .with_panes(HashMap::from([
+                ("@1".into(), vec![50]), ("@2".into(), vec![60])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([
+            procs(50, vec!["/home/u/bin/pinga"]), procs(60, vec!["sh"])]));
+        let guard = guard_console(&l, "main", &exe()).unwrap().expect("a console runs");
+        assert_eq!(guard.window, "@1");
+        assert_eq!(guard.label.as_deref(), Some("1:@1"),
+            "the message shows the status-bar label, not the raw id");
+        assert!(guard.switched);
+        assert_eq!(tmux.selected(), vec!["@1"], "the user is switched to the console");
+    }
+
+    #[test]
+    fn console_guard_is_free_when_no_other_console_runs() {
+        let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
+            .with_panes(HashMap::from([("@1".into(), vec![50])])));
+        let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["sh"])]));
+        assert!(guard_console(&l, "main", &exe()).unwrap().is_none());
+        assert!(tmux.selected().is_empty(), "nothing selected when free");
+    }
+}
+```
 
 Versioned, fallible tracking persisted at
 `~/.local/state/pinga/tracking-v2.json` (+ `tracking-v2.lock`). The pinned JSON
@@ -4934,6 +6474,14 @@ use std::sync::Mutex;
 
 use crate::model::{ProviderId, SessionKey};
 
+/// The platform state directory for pinga tracking (shared by the console and
+/// bring-up so both read the same store).
+pub fn state_dir() -> PathBuf {
+    dirs::state_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/state"))
+        .join("pinga")
+}
+
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// Lifecycle state of a known tracked session. Interruption, once established,
@@ -4949,11 +6497,31 @@ pub enum TrackedState {
 
 /// A tagged tracking record. `id` is the stable unique record id allocated
 /// under the shared lock; newly added records carry 0 and are assigned on
-/// commit (overflow is an error).
+/// commit (overflow is an error). `window_index`/`window_name` are the Known
+/// record's restore-stable window identity: the raw `window` id is reassigned
+/// by a tmux-resurrect restore, but the window order and name are replayed —
+/// so bring-up (R12) can find the session's original window after a reboot
+/// and restart it in place. Both are optional (legacy/opaque); missing values
+/// are backfilled from the live window when possible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TrackedRecord {
-    Known { id: u64, provider: ProviderId, session: String, window: String, state: TrackedState },
+    Known {
+        id: u64,
+        provider: ProviderId,
+        session: String,
+        window: String,
+        #[serde(default)]
+        window_index: Option<u64>,
+        #[serde(default)]
+        window_name: Option<String>,
+        /// Names this session was previously known by (pinga's own renames,
+        /// stored so a client still running under an OLD title is not
+        /// blindsided — the codex argv keeps the name from open time).
+        #[serde(default)]
+        aliases: Vec<String>,
+        state: TrackedState,
+    },
     Pending { id: u64, provider: ProviderId, window: String, label: String },
     Opaque { id: u64, provider_index: usize, session: String, window: String },
 }
@@ -4987,6 +6555,53 @@ impl TrackedRecord {
             }
             _ => None,
         }
+    }
+    /// The restore-stable window identity of a Known record, if captured.
+    pub fn window_identity(&self) -> Option<(Option<u64>, Option<&str>)> {
+        match self {
+            TrackedRecord::Known { window_index, window_name, .. } => {
+                Some((*window_index, window_name.as_deref()))
+            }
+            _ => None,
+        }
+    }
+    /// The recorded window name of a Known record, if captured.
+    pub fn window_name(&self) -> Option<&str> {
+        match self {
+            TrackedRecord::Known { window_name, .. } => window_name.as_deref(),
+            _ => None,
+        }
+    }
+    /// The names a Known session was previously known by (pinga's renames).
+    pub fn aliases(&self) -> &[String] {
+        match self {
+            TrackedRecord::Known { aliases, .. } => aliases,
+            _ => &[],
+        }
+    }
+    /// Record an old name (best-effort: only Known, only when it differs from
+    /// the current name and is not already stored). Returns whether changed.
+    pub fn add_alias(&mut self, old_name: &str) -> bool {
+        let TrackedRecord::Known { aliases, .. } = self else { return false };
+        if old_name.trim().is_empty() || aliases.iter().any(|a| a == old_name) {
+            return false;
+        }
+        aliases.push(old_name.to_string());
+        true
+    }
+    /// Re-point the record's window and refresh its restore identity; returns
+    /// whether anything changed. Used by bring-up (R12) to repair ids stale
+    /// after a tmux-resurrect restore and to record where sessions were seen.
+    pub fn set_window_identity(&mut self, window: &str, index: Option<u64>,
+                               name: Option<String>) -> bool {
+        let TrackedRecord::Known { window: slot, window_index, window_name, .. } = self else {
+            return false;
+        };
+        let mut changed = false;
+        if slot != window { *slot = window.to_string(); changed = true; }
+        if *window_index != index { *window_index = index; changed = true; }
+        if window_name.as_deref() != name.as_deref() { *window_name = name; changed = true; }
+        changed
     }
 }
 
@@ -5144,7 +6759,8 @@ fn migrate(tuples: Vec<(usize, String, String)>, next_id: &mut u64) -> Vec<Track
                 if sid.is_empty() {
                     out.push(TrackedRecord::Pending { id, provider, window: win, label: "(unresolved legacy)".into() });
                 } else {
-                    out.push(TrackedRecord::Known { id, provider, session: sid, window: win, state: TrackedState::Open });
+                    out.push(TrackedRecord::Known { id, provider, session: sid, window: win,
+                        window_index: None, window_name: None, state: TrackedState::Open, aliases: vec![] });
                 }
             }
             _ => out.push(TrackedRecord::Opaque { id, provider_index: p, session: sid, window: win }),
@@ -5291,7 +6907,8 @@ mod tests {
 
     fn known(id: u64, provider: &str, session: &str, win: &str) -> TrackedRecord {
         TrackedRecord::Known { id, provider: ProviderId::new(provider).unwrap(), session: session.into(),
-                               window: win.into(), state: TrackedState::Open }
+                               window: win.into(), window_index: None, window_name: None,
+                               aliases: vec![], state: TrackedState::Open }
     }
 
     #[test]
@@ -5436,7 +7053,8 @@ mod tests {
                 if rec.record_id() == before[0].record_id() {
                     *rec = TrackedRecord::Known { id: before[0].record_id(),
                         provider: ProviderId::new("opencode").unwrap(), session: "ses_1".into(),
-                        window: "@1".into(), state: TrackedState::Interrupted };
+                        window: "@1".into(), window_index: None, window_name: None,
+                        state: TrackedState::Interrupted, aliases: vec![] };
                 }
             }
             true
@@ -5968,7 +7586,7 @@ impl App {
         // its record was startup-eligible and whether that eligibility must be
         // preserved on a successful application.
         struct Plan { observed: TrackedRecord, eligible: bool, preserve: bool, kind: PlanKind }
-        enum PlanKind { Keep, Replace(TrackedRecord), Remove }
+        enum PlanKind { Keep, Replace(TrackedRecord), Remove, Add(TrackedRecord) }
         let mut plans: Vec<Plan> = Vec::new();
         for r in &observed {
             match r {
@@ -5994,7 +7612,8 @@ impl App {
                                         kind: PlanKind::Replace(TrackedRecord::Known {
                                             id: *id, provider: provider.clone(),
                                             session: key.native_id().to_string(),
-                                            window: window.clone(), state: TrackedState::Open }) }),
+                                            window: window.clone(), window_index: None,
+                                            window_name: None, state: TrackedState::Open, aliases: vec![] }) }),
                                     None => plans.push(Plan { observed: r.clone(), eligible: false, preserve: true, kind: PlanKind::Keep }),
                                 }
                             } else {
@@ -6003,7 +7622,7 @@ impl App {
                         }
                     }
                 }
-                TrackedRecord::Known { id, provider, session, window, state } => {
+                TrackedRecord::Known { id, provider, session, window, window_index, window_name, aliases, state } => {
                     let eligible = self.startup_eligible.contains(id);
                     let view_i = view_index_for(provider, &views);
                     let prov_ok = view_i.map(|i| views[i].ok).unwrap_or(false);
@@ -6017,21 +7636,22 @@ impl App {
                         plans.push(Plan { observed: r.clone(), eligible, preserve: false, kind: PlanKind::Remove });
                         continue;
                     }
-                    let (running_here, uncertain) = match &evidence {
+                    let (running_here, uncertain, matches) = match &evidence {
                         Some(ev) => {
                             let s = views[view_i.unwrap()].snapshot.iter().find(|s| s.id == *session);
                             match s {
                                 Some(s) => {
                                     let m = providers.get(provider).expect("provider")
-                                        .match_session(s, &views[view_i.unwrap()].snapshot, ev);
+                                        .match_session_aliased(s, aliases, &views[view_i.unwrap()].snapshot, ev);
                                     let mine: Vec<_> = m.iter().filter(|x| x.window_id == *window).collect();
                                     (mine.iter().any(|x| x.confidence == MatchConfidence::Confirmed),
-                                     mine.iter().any(|x| x.confidence != MatchConfidence::Confirmed))
+                                     mine.iter().any(|x| x.confidence != MatchConfidence::Confirmed),
+                                     m)
                                 }
-                                None => (false, true),
+                                None => (false, true, Vec::new()),
                             }
                         }
-                        None => (false, true), // unknown evidence
+                        None => (false, true, Vec::new()), // unknown evidence
                     };
                     match state {
                         TrackedState::Interrupted => {
@@ -6039,7 +7659,9 @@ impl App {
                                 plans.push(Plan { observed: r.clone(), eligible, preserve: false,
                                     kind: PlanKind::Replace(TrackedRecord::Known {
                                         id: *id, provider: provider.clone(), session: session.clone(),
-                                        window: window.clone(), state: TrackedState::Open }) });
+                                        window: window.clone(), window_index: *window_index,
+                                        window_name: window_name.clone(),
+                                        state: TrackedState::Open, aliases: vec![] }) });
                             } else {
                                 plans.push(Plan { observed: r.clone(), eligible, preserve: true, kind: PlanKind::Keep });
                             }
@@ -6051,7 +7673,9 @@ impl App {
                                         plans.push(Plan { observed: r.clone(), eligible, preserve: false,
                                             kind: PlanKind::Replace(TrackedRecord::Known {
                                                 id: *id, provider: provider.clone(), session: session.clone(),
-                                                window: window.clone(), state: TrackedState::Interrupted }) });
+                                                window: window.clone(), window_index: *window_index,
+                                                window_name: window_name.clone(),
+                                                state: TrackedState::Interrupted, aliases: vec![] }) });
                                     } else {
                                         plans.push(Plan { observed: r.clone(), eligible, preserve: false, kind: PlanKind::Remove });
                                     }
@@ -6062,7 +7686,30 @@ impl App {
                                     } else if uncertain || !evidence.as_ref().map(|e| e.complete).unwrap_or(false) {
                                         plans.push(Plan { observed: r.clone(), eligible, preserve: true, kind: PlanKind::Keep });
                                     } else {
-                                        plans.push(Plan { observed: r.clone(), eligible, preserve: false, kind: PlanKind::Remove });
+                                        // Not running in its RECORDED window — but
+                                        // possibly running in another one (stale id
+                                        // after a tmux-server restart, or the window
+                                        // was reused while the session lives on).
+                                        // Re-point instead of dropping: a confirmed
+                                        // match elsewhere is adoption evidence, and
+                                        // a rename must never silently erase a
+                                        // running session's record (2026-10-04 fix).
+                                        let elsewhere: Vec<_> = matches.iter()
+                                            .filter(|x| x.confidence == MatchConfidence::Confirmed)
+                                            .collect();
+                                        if elsewhere.len() == 1 && elsewhere[0].window_id != *window {
+                                            let win = elsewhere[0].window_id.clone();
+                                            let identity = launcher.window_index_name(&win)
+                                                .map(|(i, n)| (Some(i), Some(n))).unwrap_or((None, None));
+                                            plans.push(Plan { observed: r.clone(), eligible, preserve: false,
+                                                kind: PlanKind::Replace(TrackedRecord::Known {
+                                                    id: *id, provider: provider.clone(),
+                                                    session: session.clone(), window: win,
+                                                    window_index: identity.0, window_name: identity.1,
+                                                    state: TrackedState::Open, aliases: vec![] }) });
+                                        } else {
+                                            plans.push(Plan { observed: r.clone(), eligible, preserve: false, kind: PlanKind::Remove });
+                                        }
                                     }
                                 }
                                 None => {
@@ -6082,6 +7729,47 @@ impl App {
         // same-id record), not merely what was proposed.
         enum Applied { KeptEligible(u64), Removed }
         let mut applied: Vec<Applied> = Vec::new();
+        let mut additions: Vec<TrackedRecord> = Vec::new();
+        // Auto-track (R12): a session observed running in a window pinga does
+        // not track yet is recorded, so it survives a reboot like any tracked
+        // session (the user's hand-opened codex sessions are the canonical
+        // case). Only a COMPLETE scan with exactly ONE Confirmed window is
+        // trusted; ambiguous or incomplete evidence never creates a record.
+        if let Some(ev) = evidence.as_ref() {
+            if ev.complete {
+                for (i, v) in views.iter().enumerate() {
+                    if !v.ok { continue; }
+                    let Some(prov) = providers.get_index(i) else { continue };
+                    for s in &v.snapshot {
+                        let already = observed.iter().any(|r| match r {
+                            TrackedRecord::Known { provider: p, session, .. } => {
+                                *p == s.provider_id && *session == s.id
+                            }
+                            _ => false,
+                        });
+                        if already { continue; }
+                        let m = prov.match_session(s, &v.snapshot, ev);
+                        let confirmed: Vec<_> = m.iter()
+                            .filter(|x| x.confidence == MatchConfidence::Confirmed).collect();
+                        if confirmed.len() != 1 { continue; }
+                        let win = confirmed[0].window_id.clone();
+                        // A pending launch may own this window; its resolution
+                        // is the existing pending logic's job.
+                        if observed.iter().any(|r| matches!(
+                            r, TrackedRecord::Pending { provider: p, window: w, .. }
+                            if *p == s.provider_id && *w == win)) {
+                            continue;
+                        }
+                        let identity = launcher.window_index_name(&win)
+                            .map(|(i, n)| (Some(i), Some(n))).unwrap_or((None, None));
+                        additions.push(TrackedRecord::Known {
+                            id: 0, provider: s.provider_id.clone(), session: s.id.clone(),
+                            window: win, window_index: identity.0, window_name: identity.1,
+                            state: TrackedState::Open, aliases: vec![] });
+                    }
+                }
+            }
+        }
         let result = self.store.update(&mut |recs| {
             let mut changed = false;
             for plan in &plans {
@@ -6102,7 +7790,17 @@ impl App {
                         if *new != recs[pos] { recs[pos] = new.clone(); changed = true; }
                     }
                     PlanKind::Remove => { recs.remove(pos); changed = true; applied.push(Applied::Removed); }
+                    PlanKind::Add(_) => {}
                 }
+            }
+            // Auto-tracked additions: never duplicate an existing record for
+            // the same (provider, session) key, even one added concurrently.
+            for add in &additions {
+                let TrackedRecord::Known { provider: ap, session: as_, .. } = add else { continue };
+                let dup = recs.iter().any(|r| matches!(
+                    r, TrackedRecord::Known { provider: p, session: s, .. }
+                    if p == ap && s == as_));
+                if !dup { recs.push(add.clone()); changed = true; }
             }
             changed
         });
@@ -6151,7 +7849,15 @@ impl App {
                     let mut r = Vec::new();
                     if let Some(p) = self.provider(&id) {
                         for s in &snapshot {
-                            if p.match_session(s, &snapshot, &ev)
+                            // Aliases let a session renamed by pinga stay in
+                            // the running group while its client still runs
+                            // under the old title.
+                            let aliases: Vec<String> = self.records.iter()
+                                .find(|rec| matches!(rec,
+                                    TrackedRecord::Known { provider: p2, session: sid, .. }
+                                    if *p2 == id && *sid == s.id))
+                                .map(|rec| rec.aliases().to_vec()).unwrap_or_default();
+                            if p.match_session_aliased(s, &aliases, &snapshot, &ev)
                                 .iter().any(|m| m.confidence == MatchConfidence::Confirmed) {
                                 r.push(s.id.clone());
                             }
@@ -6337,7 +8043,16 @@ impl App {
         }
         if self.edited.is_some() { return self.handle_edit_key(code); }
         match code {
-            Char('q') | Esc => return Err(anyhow!(QUIT_MSG)),
+            Char('q') | Esc => {
+                // Exit forensics (2026-10-04): name the exact key that quit
+                // the console. Always-on — see run_console_inner.
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(
+                    crate::tracking::state_dir().join("console-exit.log")) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "quit key: {code:?}");
+                }
+                return Err(anyhow!(QUIT_MSG));
+            }
             Enter => return self.open_selected(false),
             Char('m') => return self.toggle_mouse(),
             Char('s') => return self.suggest_current(false),
@@ -6729,6 +8444,12 @@ impl App {
         let p0 = provider.clone();
         let k0 = known.clone();
         let w0 = win.to_string();
+        // Capture the window's restore-stable identity (index/name) best-effort
+        // so bring-up (R12) can restart the session in THIS window after a
+        // reboot, when resurrect has reassigned every window id.
+        let identity = self.launcher.window_index_name(win)
+            .map(|(i, n)| (Some(i), Some(n))).unwrap_or((None, None));
+        let (i0, n0) = (identity.0, identity.1);
         self.records = match store.update(&mut |recs| {
             match &k0 {
                 Some(key) => {
@@ -6736,7 +8457,8 @@ impl App {
                         if *q == p0 && session == key.native_id()));
                     recs.push(TrackedRecord::Known { id: 0, provider: p0.clone(),
                                                      session: key.native_id().to_string(),
-                                                     window: w0.clone(), state: TrackedState::Open });
+                                                     window: w0.clone(), window_index: i0,
+                                                     window_name: n0.clone(), state: TrackedState::Open, aliases: vec![] });
                 }
                 None => {
                     recs.push(TrackedRecord::Pending { id: 0, provider: p0.clone(),
@@ -6822,12 +8544,18 @@ impl App {
                 let p = provider.clone();
                 let k = key.clone();
                 let w = win.clone();
+                // Best-effort identity capture, as in `record_launch` — the
+                // adopted window may outlive this boot and need restoring.
+                let identity = self.launcher.window_index_name(win)
+                    .map(|(i, n)| (Some(i), Some(n))).unwrap_or((None, None));
                 self.records = self.store.update(&mut |recs| {
                     recs.retain(|r| !matches!(r, TrackedRecord::Known { provider: q, session, .. }
                         if *q == p && session == k.native_id()));
                     recs.push(TrackedRecord::Known { id: 0, provider: p.clone(),
                                                      session: k.native_id().to_string(),
-                                                     window: w.clone(), state: TrackedState::Open });
+                                                     window: w.clone(), window_index: identity.0,
+                                                     window_name: identity.1.clone(),
+                                                     state: TrackedState::Open, aliases: vec![] });
                     true
                 })?;
                 self.launcher.select_window(win)
@@ -6869,6 +8597,7 @@ impl App {
         let name = self.naming.suggest(&seed);
         if commit {
             self.provider(&id).expect("provider").rename(&s, &name)?;
+            self.rename_tracked_window(&s, &name);
             self.refresh();
         } else {
             self.edited = Some(EditState::Rename(TextEdit::new(&name)));
@@ -6905,9 +8634,41 @@ impl App {
         if let Some(s) = self.focused_session().cloned() {
             let id = s.provider_id.clone();
             self.provider(&id).expect("provider").rename(&s, title)?;
+            self.rename_tracked_window(&s, title);
             self.refresh();
         }
         Ok(())
+    }
+
+    /// After a successful provider rename, ALSO rename the tracked tmux window
+    /// so the status-bar label follows the session (best-effort), refresh the
+    /// record's restore identity so boot restore still finds it by name, and
+    /// STORE the old title as an alias — a client already running in that
+    /// window keeps the old title in its argv, and the alias lets the matcher
+    /// still confirm it (pinga is never blindsided by its own rename).
+    fn rename_tracked_window(&mut self, s: &Session, title: &str) {
+        let Some(rec) = self.records.iter().find(|r| matches!(
+            r, TrackedRecord::Known { provider: p, session: sid, .. }
+            if *p == s.provider_id && *sid == s.id)) else { return };
+        let old_title = s.display_title().to_string();
+        let win = rec.window().to_string();
+        let label: String = title.chars().take(24).collect();
+        if self.launcher.rename_window(&win, &label).is_err() { return; }
+        if let Ok((index, _)) = self.launcher.window_index_name(&win) {
+            let rid = rec.record_id();
+            let _ = self.store.update(&mut |recs| {
+                let mut changed = false;
+                for r in recs.iter_mut() {
+                    if r.record_id() == rid {
+                        changed |= r.set_window_identity(&win, Some(index), Some(label.clone()));
+                        if old_title != title {
+                            changed |= r.add_alias(&old_title);
+                        }
+                    }
+                }
+                changed
+            });
+        }
     }
 
     fn seed_for(&self, s: &Session) -> String {
@@ -7312,7 +9073,7 @@ fn hit_rect(x: u16, y: u16, left: Rect, right: Option<Rect>) -> (Option<usize>, 
 mod tests {
     use super::*;
     use crate::launcher::{Foreground, ProcReader, ProcTree, Tmux};
-    use crate::model::{ProcessEvidence, WindowMatch};
+    use crate::model::{ProcEvidence, ProcessEvidence, WindowMatch};
     use crate::provider::ProviderDescriptor;
     use crate::tracking::{self, TrackedRecord, TrackedState};
     use ratatui::backend::TestBackend;
@@ -7418,6 +9179,7 @@ mod tests {
         new_win_err: bool,
         created: Arc<Mutex<Vec<(String, Vec<String>)>>>,
         selected: Arc<Mutex<Vec<String>>>,
+        renamed_windows: Arc<Mutex<Vec<(String, String)>>>,
         next_win: AtomicUsize,
     }
     impl FakeTmux {
@@ -7427,6 +9189,7 @@ mod tests {
                    alive_err: Arc::new(AtomicBool::new(false)),
                    list_ids_err: false, new_win_err: false,
                    created: Arc::new(Mutex::new(Vec::new())), selected: Arc::new(Mutex::new(Vec::new())),
+                   renamed_windows: Arc::new(Mutex::new(Vec::new())),
                    next_win: AtomicUsize::new(10) }
         }
         fn set_alive(&mut self, win: &str, alive: bool) {
@@ -7457,6 +9220,28 @@ mod tests {
         fn pane_root_pids(&self, win: &str) -> anyhow::Result<Vec<u64>> {
             Ok(self.panes.get(win).cloned().unwrap_or_default())
         }
+        fn has_session(&self, name: &str) -> anyhow::Result<bool> { Ok(name == "main") }
+        fn new_session(&self, _n: &str, _l: &str, _c: &[String]) -> anyhow::Result<String> {
+            Ok("@0".into())
+        }
+        fn attach(&self, _n: &str) -> anyhow::Result<()> { Ok(()) }
+        fn list_windows(&self, _s: &str) -> anyhow::Result<Vec<String>> {
+            Ok(self.list_ids.clone())
+        }
+        fn window_label(&self, win: &str) -> anyhow::Result<String> {
+            Ok(format!("0:{win}"))
+        }
+        fn window_index_name(&self, win: &str) -> anyhow::Result<(u64, String)> {
+            Ok((0, win.into()))
+        }
+        fn session_windows(&self, _s: &str) -> anyhow::Result<Vec<(String, u64, String)>> {
+            Ok(vec![])
+        }
+        fn respawn_pane(&self, _w: &str, _c: &[String]) -> anyhow::Result<()> { Ok(()) }
+        fn rename_window(&self, win: &str, label: &str) -> anyhow::Result<()> {
+            self.renamed_windows.lock().unwrap().push((win.into(), label.into())); Ok(())
+        }
+        fn move_window_to_front(&self, _win: &str, _session: &str) -> anyhow::Result<()> { Ok(()) }
     }
 
     struct FakeForeground { err: bool, runs: Arc<AtomicUsize> }
@@ -7527,7 +9312,8 @@ mod tests {
 
     fn known_rec(provider: &str, session: &str, win: &str, state: TrackedState) -> TrackedRecord {
         TrackedRecord::Known { id: 1, provider: ProviderId::new(provider).unwrap(), session: session.into(),
-                               window: win.into(), state }
+                               window: win.into(), window_index: None, window_name: None,
+                               aliases: vec![], state }
     }
 
     #[test]
@@ -7545,6 +9331,63 @@ mod tests {
         assert!(rendered.contains("native title: window label only"));
         assert!(rendered.contains("cwd: not honoured"));
         assert!(!rendered.contains("native title: applied"));
+    }
+
+    #[test]
+    fn observed_running_session_is_auto_tracked_and_never_duplicated() {
+        // A session the user started by hand (e.g. codex in a shell window) is
+        // observed running with one Confirmed window: it must be recorded so a
+        // reboot can restore it (R12 auto-track).
+        let mut f = FakeProvider::new("one");
+        *f.list_out.lock().unwrap() = vec![fake_session("one", "s-hand")];
+        f.match_out = vec![WindowMatch { window_id: "@9".into(),
+                                         confidence: MatchConfidence::Confirmed }];
+        let reg = make_registry(vec![f]);
+        let mut tmux = FakeTmux::new(true);
+        tmux.list_ids = vec!["@9".into()];
+        tmux.panes.insert("@9".into(), vec![100]);
+        tmux.set_alive("@9", true);
+        let mut app = make_app(reg, tmux, FakeProc { trees: HashMap::from([
+            (100, ProcTree { procs: vec![ProcEvidence { pid: 100,
+                argv: vec!["codex".into(), "resume".into()], env: vec![] }],
+                complete: true }),
+        ])}, Box::new(tracking::MemStore::new(vec![])));
+        app.refresh();
+        assert!(app.records.iter().any(|r| matches!(
+            r, TrackedRecord::Known { provider, session, window, .. }
+            if provider.as_str() == "one" && session == "s-hand" && window == "@9")),
+            "an observed running session is tracked: {:?}", app.records);
+        // The record must not be recreated on the next refresh.
+        app.refresh();
+        let n = app.records.iter().filter(|r| matches!(
+            r, TrackedRecord::Known { session, .. } if session == "s-hand")).count();
+        assert_eq!(n, 1, "auto-track never duplicates");
+    }
+
+    #[test]
+    fn rename_also_renames_the_tracked_window_and_refreshes_identity() {
+        let mut f = FakeProvider::new("one");
+        *f.list_out.lock().unwrap() = vec![fake_session("one", "s1")];
+        f.match_out = vec![WindowMatch { window_id: "@10".into(),
+                                         confidence: MatchConfidence::Confirmed }];
+        let reg = make_registry(vec![f]);
+        let mut tmux = FakeTmux::new(true);
+        tmux.list_ids = vec!["@10".into()];
+        tmux.set_alive("@10", true);
+        let renamed = Arc::clone(&tmux.renamed_windows);
+        let store = Box::new(tracking::MemStore::new(vec![
+            known_rec("one", "s1", "@10", TrackedState::Open)]));
+        let mut app = make_app(reg, tmux, FakeProc { trees: HashMap::new() }, store);
+        app.refresh();
+        app.view_mut(0).sel = 1; // first session row (after "+ new")
+        app.apply_rename_to_focused("Better Name").unwrap();
+        let rw = renamed.lock().unwrap().clone();
+        assert_eq!(rw, vec![("@10".into(), "Better Name".into())],
+            "the tracked window is renamed to follow the session");
+        let rec = app.records.iter().find(|r| matches!(
+            r, TrackedRecord::Known { session, .. } if session == "s1")).unwrap();
+        assert_eq!(rec.window_name(), Some("Better Name"),
+            "the record's restore identity follows the rename");
     }
 
     #[test]
@@ -8042,7 +9885,7 @@ mod tests {
         // Seed a Known record AFTER startup (not eligible); the store allocates its id.
         let pending_open = TrackedRecord::Known { id: 0, provider: ProviderId::new("one").unwrap(),
                                                   session: "s2".into(), window: "@9".into(),
-                                                  state: TrackedState::Open };
+                                                  window_index: None, window_name: None, state: TrackedState::Open, aliases: vec![] };
         app2.store.update(&mut |r| { r.push(pending_open.clone()); true }).unwrap();
         app2.records = app2.store.read().unwrap();
         app2.startup_eligible_initialized = true;
@@ -8156,7 +9999,7 @@ mod tests {
             r.clear();
             r.push(TrackedRecord::Known { id: 0, provider: ProviderId::new("one").unwrap(),
                                           session: "s1".into(), window: "@1".into(),
-                                          state: TrackedState::Open });
+                                          window_index: None, window_name: None, state: TrackedState::Open, aliases: vec![] });
             r.push(TrackedRecord::Pending { id: 0, provider: ProviderId::new("one").unwrap(),
                                             window: "@9".into(), label: "n".into() });
             true
@@ -8197,7 +10040,7 @@ mod tests {
                     r.clear();
                     r.push(TrackedRecord::Known { id: 0,
                         provider: ProviderId::new("one").unwrap(), session: "s1".into(),
-                        window: "@1".into(), state: TrackedState::Open });
+                        window: "@1".into(), window_index: None, window_name: None, state: TrackedState::Open, aliases: vec![] });
                     r.push(TrackedRecord::Pending { id: 0,
                         provider: ProviderId::new("one").unwrap(), window: "@9".into(), label: "n".into() });
                     true
@@ -8280,7 +10123,7 @@ mod tests {
         tracking::FileTrackingStore::new(dir.clone()).update(&mut |r| {
             r.push(TrackedRecord::Known { id: 0,
                 provider: ProviderId::new("one").unwrap(), session: "s1".into(),
-                window: "@1".into(), state: TrackedState::Open });
+                window: "@1".into(), window_index: None, window_name: None, state: TrackedState::Open, aliases: vec![] });
             true
         }).unwrap();
         let store = Box::new(RacingStore::new(&dir));
@@ -8555,7 +10398,11 @@ mod tests {
 
 ### 11.12 Entrypoint (`core::main`)
 
-Tiny on purpose: terminal in/out is here, the loop is in `tui::app`.
+Tiny on purpose: terminal in/out is here, the loop is in `tui::app`. R12 adds
+the dispatch: bare `pinga` inside tmux is the plain console (D5 unchanged);
+bare `pinga` outside tmux runs bring-up (creating the session and reconciling
+tracked agents) and then attaches; `pinga up` is the headless bring-up the
+boot unit runs (it never attaches — systemd has no terminal).
 
 ``` {.rust #core-main path="src/main.rs"}
 // Scaffold stage: the provider contract (§11.4–11.7) and theme (§11.9) declare
@@ -8563,6 +10410,7 @@ Tiny on purpose: terminal in/out is here, the loop is in `tui::app`.
 // subset. `make lint` stays green while the remaining fields get wired in.
 #![allow(dead_code)]
 
+mod bringup;
 mod browse;
 mod config;
 mod launcher;
@@ -8584,9 +10432,123 @@ fn main() -> anyhow::Result<()> {
     // Validate/build the provider registry BEFORE entering raw/alternate-screen
     // mode so configuration errors surface in a normal terminal.
     let providers = provider::build_registry(&cfg)?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match argv.as_slice() {
+        [] => auto_mode(cfg, providers),
+        ["up"] => {
+            let report = run_bringup(&cfg, &providers)?;
+            print_report(&report);
+            Ok(())
+        }
+        ["-h"] | ["--help"] => {
+            println!("pinga — session console for opencode & codex");
+            println!("usage: pinga [up]");
+            println!("  (no args)  run the console; outside tmux: bring the");
+            println!("             tmux session up, then attach");
+            println!("  up         headless bring-up (systemd boot unit)");
+            Ok(())
+        }
+        _ => Err(anyhow::anyhow!("usage: pinga [up]")),
+    }
+}
+
+/// Console exit forensics (2026-10-04): consoles were dying cleanly with no
+/// input in sight and no exit path reached. Every phase of the console's
+/// startup appends here; the LAST line before silence names where it stopped
+/// (a missing "console exit" line means the process was killed — e.g. by a
+/// signal — rather than exiting through the code).
+pub fn console_log(line: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(
+        tracking::state_dir().join("console-exit.log")) {
+        use std::io::Write;
+        let _ = writeln!(f, "{} {line}", timestamp());
+    }
+}
+
+fn timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| format!("{}", d.as_secs())).unwrap_or_default()
+}
+
+/// Bare invocation. Inside tmux: the plain console — but only one console per
+/// tmux session (a second instance is refused, pointing at the running one).
+/// Outside: bring everything up, then attach a client to the session.
+fn auto_mode(cfg: config::Config, providers: provider::ProviderRegistry) -> anyhow::Result<()> {
+    console_log("auto_mode start");
+    let launcher = launcher::Launcher::real();
+    if launcher.in_tmux() {
+        console_log("inside tmux: guard");
+        let session = launcher.current_session()?;
+        if let Some(guard) = bringup::guard_console(
+            &launcher, &session, &std::env::current_exe()?)? {
+            console_log("guard: redirected");
+            // Show the index:name label the user sees in the status bar; fall
+            // back to the @N window id only if tmux could not report it.
+            let where_ = guard.label.as_deref().unwrap_or(&guard.window);
+            if guard.switched {
+                eprintln!("another pinga console is already running in this tmux session \
+                           (window {where_}); switched you to it");
+            } else {
+                eprintln!("another pinga console is already running in this tmux session \
+                           (window {where_}); select it manually");
+            }
+            return Ok(());
+        }
+        console_log("guard: free, running console");
+        return run_console(cfg, providers);
+    }
+    console_log("outside tmux: bring-up + attach");
+    let session = cfg.tmux_session.clone();
+    let report = run_bringup(&cfg, &providers)?;
+    print_report(&report);
+    launcher.attach(&session)?;
+    Ok(())
+}
+
+/// Bring-up shared by `auto_mode` (outside tmux) and `pinga up`.
+fn run_bringup(cfg: &config::Config, providers: &provider::ProviderRegistry)
+    -> anyhow::Result<bringup::BringUpReport> {
+    let launcher = launcher::Launcher::real();
+    let store: Box<dyn tracking::TrackingStore> =
+        Box::new(tracking::FileTrackingStore::new(tracking::state_dir()));
+    bringup::bring_up(&launcher, providers, store.as_ref(),
+                      &std::env::current_exe()?, &cfg.tmux_session)
+}
+
+fn print_report(r: &bringup::BringUpReport) {
+    println!("tmux session {}: {}", r.session,
+             if r.session_created { "created" } else { "present" });
+    if let Some(win) = &r.pinga_window {
+        println!("  pinga TUI: window {win}");
+    }
+    if let Some(resurrect) = &r.resurrect {
+        println!("  resurrect service: {resurrect}");
+    }
+    for a in &r.actions {
+        match a {
+            bringup::RestoreAction::Adopted { record_id, window } => {
+                println!("  record #{record_id}: window {window} — already running");
+            }
+            bringup::RestoreAction::Restored { record_id, window } => {
+                println!("  record #{record_id}: window {window} — restarted");
+            }
+            bringup::RestoreAction::NotRunning { record_id } => {
+                println!("  record #{record_id}: not running — reopen from the console's list");
+            }
+            bringup::RestoreAction::Deferred { record_id, reason } => {
+                println!("  record #{record_id}: deferred — {reason}");
+            }
+        }
+    }
+}
+
+fn run_console(cfg: config::Config, providers: provider::ProviderRegistry) -> anyhow::Result<()> {
+    console_log("run_console: raw mode + alt screen");
     enable_raw_mode()?;
     crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
-    let result = run_console(cfg, providers);
+    let result = run_console_inner(cfg, providers);
     // Restore the terminal fully: leave the alt screen, show the cursor, and
     // disable mouse capture (otherwise the shell receives raw SGR mouse
     // sequences — numbers bound with semicolons). "quit" exits cleanly, not as Err.
@@ -8598,11 +10560,14 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-fn run_console(cfg: config::Config, providers: provider::ProviderRegistry) -> anyhow::Result<()> {
+fn run_console_inner(cfg: config::Config, providers: provider::ProviderRegistry) -> anyhow::Result<()> {
+    console_log("run_console_inner: app start");
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
     let mut app = tui::app::App::from_parts(cfg, providers)?;
+    console_log("run_console_inner: app.run() entered");
     let res = app.run(&mut term);
+    console_log(&format!("run_console_inner: app.run() returned {res:?}"));
     match &res {
         Err(e) if e.to_string() == tui::app::QUIT_MSG => Ok(()),
         Err(e) => {
@@ -8614,6 +10579,7 @@ fn run_console(cfg: config::Config, providers: provider::ProviderRegistry) -> an
         Ok(()) => res,
     }
 }
+
 ```
 
 ## 11.13 External project browser (PB-01)
