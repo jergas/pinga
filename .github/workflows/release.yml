@@ -51,8 +51,10 @@ jobs:
       - name: package asset + checksum
         run: |
           cd ${{ matrix.build_dir }}
-          if command -v sha256sum >/dev/null 2>&1; then sha256sum pinga; else shasum -a 256 pinga; fi > "${{ matrix.asset }}.sha256"
           cp pinga "${{ matrix.asset }}"
+          # Checksum the ASSET-named copy so the installer's verify matches
+          # (it downloads under the asset name).
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum "${{ matrix.asset }}"; else shasum -a 256 "${{ matrix.asset }}"; fi > "${{ matrix.asset }}.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
