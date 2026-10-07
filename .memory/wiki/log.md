@@ -558,3 +558,9 @@ Schema: Known gains #[serde(default)] window_index/window_name (additive). Gates
 
 ## [2026-10-04] ACCEPT | Thin client validated mac -> eris
 - User ran `pinga remote add eris` / `install-key` / `connect` on the mac (Syncthing-synced source, CARGO_TARGET_DIR not needed after the target/ .stignore, BSD-install portability fix, missing-tmux friendly message): `pinga remote connect eris` landed in the eris console. Initial milestone accepted; HISTORY entry added; roadmap marked accepted.
+
+## [2026-10-04] IMPL | Installer + release pipeline (roadmap 2, core done)
+- Design: ONE POSIX install.sh (not three installers) + native per-OS release artifacts. deploy/install.sh: detects OS/arch, downloads from GitHub releases (PINGA_REPO default jergas/pinga, PINGA_VERSION latest/override, PINGA_BASE_URL for tests), verifies sha256 (sha256sum/shasum portable), installs to $PREFIX/bin, and on Linux+systemd downloads the deploy bundle and installs+enables the units. Windows deliberately unsupported (console needs tmux/systemd//proc) — clear refusal message.
+- .github/workflows/release.yml: on v* tags builds linux-x86_64 (ubuntu), macos-x86_64 (macos-13), macos-aarch64 (macos-latest), packages deploy bundle, assembles unversioned assets (+ .sha256) so /releases/latest/download works, creates the release with notes.
+- pinga --version added (CARGO_PKG_VERSION). Tested end-to-end on eris via a local http server: binary install + checksum verify + unit deployment (both paths). Gates: 158 tests (one unrelated browse concurrency flake), clippy clean.
+- NOT yet done: push to origin (github.com/jergas/pinga) + first v* tag + live release run. HISTORY entry pending the first real release.
