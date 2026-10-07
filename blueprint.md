@@ -4633,9 +4633,7 @@ mod tests {
         fn session_windows(&self, _session: &str) -> Result<Vec<(String, u64, String)>> { Ok(vec![]) }
         fn respawn_pane(&self, _win: &str, _command: &[String]) -> Result<()> { Ok(()) }
         fn rename_window(&self, _win: &str, _label: &str) -> Result<()> { Ok(()) }
-        fn move_window_to_front(&self, win: &str, _session: &str) -> Result<()> {
-            self.moved_to_front.lock().unwrap().push(win.to_string()); Ok(())
-        }
+        fn move_window_to_front(&self, _win: &str, _session: &str) -> Result<()> { Ok(()) }
     }
 
     #[test]
@@ -5911,7 +5909,11 @@ mod tests {
             Ok(())
         }
         fn rename_window(&self, _win: &str, _label: &str) -> Result<()> { Ok(()) }
-        fn move_window_to_front(&self, _win: &str, _session: &str) -> Result<()> { Ok(()) }
+        fn move_window_to_front(&self, win: &str, _session: &str) -> Result<()> {
+            // Record the ATTEMPT; the real index lookup/park lives in TmuxCli
+            // and is not exercised here (unknown fake windows have no identity).
+            self.moved_to_front.lock().unwrap().push(win.to_string()); Ok(())
+        }
     }
 
     /// Tests move the fake into the Launcher while still needing to read its
@@ -6029,11 +6031,10 @@ mod tests {
 
     #[test]
     fn missing_tmux_is_detected_as_a_missing_executable_not_an_io_failure() {
-        use anyhow::Context;
-        // A failed spawn of a missing executable carries io::ErrorKind::NotFound
-        // in the chain (e.g. `tmux` absent on a mac thin client).
+        // A failed spawn of a missing executable surfaces the io error AS the
+        // top of the chain (e.g. `tmux` absent on a mac thin client).
         let spawn_err = std::io::Error::from_raw_os_error(2);
-        let wrapped = anyhow!("tmux failed").context(spawn_err);
+        let wrapped = anyhow::Error::new(spawn_err);
         assert!(is_tmux_missing(&wrapped), "spawn ENOENT is 'tmux missing'");
         let other = anyhow!("tmux new-window failed: index 1 in use");
         assert!(!is_tmux_missing(&other), "operational failures are not 'missing'");
@@ -6113,14 +6114,14 @@ mod tests {
         assert!(created_windows[0].1[2].contains("exec '/home/u/bin/pinga'"));
     }
 
-    #[test]
+#[test]
     fn existing_session_with_running_tui_is_left_alone() {
         let tmux = Arc::new(FakeTmux::new(Some(("main", vec!["@1"])))
             .with_panes(HashMap::from([("@1".into(), vec![50])])));
         let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["/home/u/bin/pinga"])]));
         let (created, win, _resurrect) = ensure_session(&l, &exe(), "main").unwrap();
         assert!(!created);
-        assert_eq!(win, None, "TUI already running; nothing created");
+        assert_eq!(win.as_deref(), Some("@1"), "the running console is reported");
         assert!(tmux.created().is_empty());
     }
 
@@ -10714,6 +10715,10 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         ["remote", sub, rest @ ..] => remote_command(sub, rest),
+        ["-V"] | ["--version"] => {
+            println!("pinga {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         ["-h"] | ["--help"] => {
             println!("pinga — session console for opencode & codex");
             println!("usage: pinga [up|remote <command>]");

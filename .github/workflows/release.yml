@@ -1,0 +1,73 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.asset }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: pinga-linux-x86_64
+          - os: macos-13
+            asset: pinga-macos-x86_64
+          - os: macos-latest
+            asset: pinga-macos-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: package asset + checksum
+        run: |
+          cd target/release
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum pinga; else shasum -a 256 pinga; fi > "${{ matrix.asset }}.sha256"
+          cp pinga "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            target/release/${{ matrix.asset }}
+            target/release/${{ matrix.asset }}.sha256
+
+  deploy-bundle:
+    name: package deploy units
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build deploy tarball
+        run: |
+          mkdir bundle
+          cp deploy/pinga-tmux-save deploy/pinga-tmux-restore bundle/
+          cp deploy/pinga-tmux-save.service deploy/pinga-tmux-save.timer \
+             deploy/pinga-tmux-restore.service deploy/pinga-up.service bundle/
+          tar czf pinga-deploy.tar.gz -C bundle .
+          sha256sum pinga-deploy.tar.gz > pinga-deploy.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deploy
+          path: |
+            pinga-deploy.tar.gz
+            pinga-deploy.tar.gz.sha256
+
+  release:
+    name: create GitHub release
+    needs: [build, deploy-bundle]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+      - name: list assets
+        run: find assets -type f | sort
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: assets/**/*
+          generate_release_notes: true
