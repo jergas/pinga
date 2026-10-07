@@ -1809,6 +1809,16 @@ impl OpencodeProvider {
                             EndpointRel::Unknown => ambiguous = true, // malformed endpoint
                         }
                     }
+                    [_, dash_s, id] if dash_s == "-s" => {
+                        // A bare `opencode -s <id>` (no endpoint) resumes that
+                        // explicit session in its own out-of-band server. It is
+                        // positive evidence about THAT session only: confirmed
+                        // for ours when the id matches; otherwise it is another
+                        // session and no candidate for ours. Without this, a
+                        // single such window (e.g. stale after tmux-resurrect)
+                        // made EVERY session open ambiguous.
+                        if id == &session.id { confirmed = true; }
+                    }
                     _ => { ambiguous = true; } // recognized exe, unknown syntax
                 }
             }
@@ -3964,7 +3974,17 @@ impl Launcher {
     pub fn collect_evidence(&self, tracked_windows: &[String]) -> Result<ProcessEvidence> {
         let mut ids = self.tmux.list_window_ids(false)?;
         for w in tracked_windows {
-            if !ids.iter().any(|i| i == w) { ids.push(w.clone()); }
+            if !ids.iter().any(|i| i == w) {
+                // Only scan tracked windows that still EXIST. A dead window's
+                // pane lookup would fail and mark the whole evidence incomplete,
+                // refusing every open — e.g. stale window ids after a
+                // tmux-resurrect restore, where ids are reassigned and @17 may
+                // no longer exist at all. A tracked window that is alive in
+                // another session is still scanned.
+                if self.tmux.window_alive(w).unwrap_or(false) {
+                    ids.push(w.clone());
+                }
+            }
         }
         let mut windows = Vec::new();
         let mut complete = true;
