@@ -545,3 +545,13 @@ Schema: Known gains #[serde(default)] window_index/window_name (additive). Gates
 - RESULT: the next drill's console SURVIVED (3+ min watch, past every previous death window, zero signals, full startup logged, strace armed). Console alive at 0:pinga; window order: 0:pinga, 2:conversation, 4:codex (+ leftover 3:pinga corpse shell, user may tidy).
 - Instrumentation kept: console-exit.log (unconditional), quit-key logging, phase logs; strace watcher in /tmp/opencode/trace stays armed for the next death, if any.
 - Gates: 152 tests, clippy clean, installed.
+
+## [2026-10-04] PREP + IMPL | Repo governance + thin-client first slice
+- Added LICENSE (AGPLv3-or-later), roadmap.md (priorities: 1 thin client, 2 installer+GitHub, 3 codex server-side rename spike, 4 thick-lite listing, 5 boot telemetry/doctor, 6 docs), HISTORY.md (one-liner-per-feature changelog with dates; old entries immutable except odd corrections), and recorded the policy in AGENTS.md (Changelog & Roadmap Policy) so all agents see it.
+- Thin client (roadmap 1) FIRST slice landed: `core::remote` (blueprint §11.8d, src/remote.rs) — pinga-owned ~/.config/pinga/remotes.toml (atomic save), per-host ed25519 keys (~/.ssh/pinga-<name>, generated only if missing, never overwritten), pure argv builders (test/connect/install/keygen — no shell interpolation), CLI `pinga remote list|add|keygen|install-key|test|connect`. Live smoke: add + keygen + test (BatchMode host-key refusal is the correct fail-safe). 157 tests, clippy clean, installed. Remotes file set to eris 100.115.173.85 (the mac's Tailscale address).
+- HISTORY/roadmap/LICENSE/AGENTS changes are UNCOMMITTED; thin client needs the mac-side install-key + connect validation before its HISTORY entry.
+
+## [2026-10-04] FIX | thin-client mac onboarding: missing-tmux message + target/ sync lessons
+- Mac `make install` produced "zsh: exec format error": target/ was synced by Syncthing (sync root = ~/projects, no .stignore), so the mac installed eris's Linux ELF. Fix: /pinga/target in ~/projects/.stignore (per-device — mac needs its own), and Makefile portable for BSD install (mkdir -p + -m, no -D) + units only deployed when systemctl exists (mac prints a note only).
+- Second mac issue: bare `pinga` failed with raw spawn ENOENT (no tmux on macOS). Fix: bring_up detects io::ErrorKind::NotFound in the error chain (is_tmux_missing, unit-tested) and prints "tmux is not installed on this machine... use `pinga remote connect <name>`". Verified by simulating PATH without tmux.
+- Next: mac flow = remote add eris 100.115.173.85 edgar -> install-key (password once) -> connect.
