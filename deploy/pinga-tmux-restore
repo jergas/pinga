@@ -5,13 +5,36 @@
 # tpm/continuum's automatic restore on server start is unreliable here, so this
 # is the belt-and-suspenders path: it starts a tmux server (if none), runs
 # tmux-resurrect's restore.sh from the latest save, and drops the throwaway
-# session it used to bootstrap the server.
-if ! command -v tmux >/dev/null 2>&1; then exit 0; fi
+# session it used to bootstrap the server. Everything is logged to stderr so
+# the journal shows WHY a boot restore failed (restore.sh's own errors were
+# previously swallowed by `tmux run-shell`, which reports spawn success only).
+STATUS_DIR="$HOME/.local/state/pinga"
+STATUS="$STATUS_DIR/restore-status.txt"
+
+# The status file is pinga's channel back from this service (the user's
+# requirement): pinga asks for the resurrect and is told what happened, so it
+# never jumps the gun and knows when to fall back to its own bring-up.
+report() { mkdir -p "$STATUS_DIR" && echo "$1" > "$STATUS"; }
+
+if ! command -v tmux >/dev/null 2>&1; then
+    echo "pinga-tmux-restore: tmux not found; skipping" >&2
+    report "FAIL tmux not found"
+    exit 0
+fi
 
 SAVE="$HOME/.tmux/resurrect/last"
 RESTORE="$HOME/.tmux/plugins/tmux-resurrect/scripts/restore.sh"
-[ -f "$SAVE" ] || exit 0
-[ -f "$RESTORE" ] || exit 0
+if [ ! -f "$SAVE" ]; then
+    echo "pinga-tmux-restore: no resurrect save yet ($SAVE); skipping" >&2
+    report "SKIP no resurrect save"
+    exit 0
+fi
+if [ ! -f "$RESTORE" ]; then
+    echo "pinga-tmux-restore: restore.sh missing ($RESTORE); skipping" >&2
+    report "SKIP restore.sh missing"
+    exit 0
+fi
+echo "pinga-tmux-restore: restoring from $(readlink -f "$SAVE")" >&2
 
 # Need a tmux server to restore into; start one if none is running.
 started=0
@@ -21,12 +44,39 @@ if ! tmux ls >/dev/null 2>&1; then
 fi
 
 SESSION="$(tmux ls -F '#{session_name}' 2>/dev/null | head -n1)"
-[ -z "$SESSION" ] && exit 0
+if [ -z "$SESSION" ]; then
+    echo "pinga-tmux-restore: no tmux server available; skipping" >&2
+    report "FAIL no tmux server"
+    exit 0
+fi
 
-tmux run-shell -t "$SESSION" "$RESTORE" >/dev/null 2>&1
+# Blocking run-shell: the client waits for restore.sh, and its output is
+# captured (the old non-captured form silently hid every failure).
+OUT="$(mktemp)"
+if tmux run-shell -t "$SESSION" "$RESTORE" >"$OUT" 2>&1; then
+    echo "pinga-tmux-restore: restore.sh finished" >&2
+else
+    echo "pinga-tmux-restore: restore.sh FAILED ($?)" >&2
+fi
+if [ -s "$OUT" ]; then
+    echo "pinga-tmux-restore: restore.sh output:" >&2
+    cat "$OUT" >&2
+fi
+rm -f "$OUT"
+
+echo "pinga-tmux-restore: sessions after restore:" >&2
+SESSIONS="$(tmux ls -F '#{session_name}: #{session_windows} window(s)' 2>&1)"
+echo "$SESSIONS" >&2
+N="$(printf '%s\n' "$SESSIONS" | grep -v __pinga_restore__ | grep -c . || true)"
+if [ "$N" -ge 1 ]; then
+    report "OK $N sessions"
+else
+    report "FAIL nothing restored"
+fi
 
 # Drop the throwaway session we used to bootstrap the server.
 if [ "$started" = 1 ] && tmux has-session -t __pinga_restore__ >/dev/null 2>&1; then
     tmux kill-session -t __pinga_restore__ >/dev/null 2>&1
+    echo "pinga-tmux-restore: dropped throwaway session" >&2
 fi
 exit 0

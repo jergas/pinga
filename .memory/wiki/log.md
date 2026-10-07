@@ -444,3 +444,104 @@ tmux-vs-bare modes, cautious-user working style, ai-memory scope).
 - NOTE for future agents: NEVER run `pgrep -af "opencode" | xargs kill` — it
   also kills the agent's own opencode client (the session quit when I did this).
   The user's own clients may also run `opencode -s <id>`; use tmux pane kills.
+
+## [2026-10-03] IMPL | R12 reboot bring-up: `pinga up` + bare-pinga boot/attach (D12)
+- D12 design agreed with user: layered restore (opencode.service -> tmux-resurrect replay -> `pinga up` reconcile); one tmux session (default `main`, config `tmux_session`/`PINGA_TMUX_SESSION`); window 0 = pinga TUI (recursive invocation); resurrect stays as the layout safety net for manual windows.
+- New `core::bringup` (src/bringup.rs): ensure_session (has-session/new-session detached + TUI window verified by pane argv, created if missing) + reconcile of tracking-v2.json Known/open records: adopt on exactly one Confirmed window (repairs stale window ids — resurrect reassigns them), launch via resume_plan when missing (only on complete evidence + session in listing, listing retried 3x/2s for boot races), defer otherwise (ambiguous/incomplete/listing failure/gone). Never launches blind.
+- Tmux trait grew has_session/new_session/attach/list_windows; Launcher gained collect_evidence_in + open_in_tmux_in (named-session variants); tracking gained set_window + state_dir().
+- CLI: bare `pinga` outside tmux = bring-up then attach; inside tmux = console unchanged; `pinga up` = headless bring-up (systemd). deploy/pinga-up.service + make install/uninstall wiring.
+- Gates green: 133 tests, clippy --all-targets -D warnings, repeat tangle fidelity, release build. Not committed; NOT run live (would create the session / launch real agents on the user's machine).
+
+## [2026-10-03] IMPL | Single console per tmux session (D12 follow-up)
+- Answering lifecycle design questions: quitting the console never tears the tmux session down (agents + manual windows outlive it; restart in the same window just resumes — store is durable); no quit prompt (quick q stays quick); full teardown stays an explicit tmux action, not a quit side-effect.
+- New guard: `bringup::other_tui_in` — pane-argv scan of the current session for another pinga console, self-excluding by pid; `auto_mode` inside tmux refuses with the running window's id. Restart-in-place (no other instance) passes, so quit+restart just works. Incomplete evidence never refuses (duplicate console is benign via the cooperative store).
+- Gates green: 136 tests, clippy --all-targets -D warnings, release build. Not committed; not run live.
+
+## [2026-10-03] IMPL | Second-console refusal now redirects to the running console
+- User asked whether a refused second pinga should switch to the running console's window: yes — it fulfills the user's intent (they typed pinga wanting the console) and mirrors D8's select-instead-of-duplicate. New `bringup::guard_console` (other_tui_in scan + best-effort `select_window`), returns ConsoleGuard{window, switched}; auto_mode prints where it went and exits 0; switch failure tells the user to select manually.
+- Gates green: 138 tests, clippy --all-targets -D warnings, release build. Not committed; not run live.
+
+## [2026-10-03] FIX | Second-console guard defeated by bare argv0; session name mismatch
+- User reproduced: quit console, restarted, opened a NEW window and ran pinga → a second console came up instead of redirecting. Root cause: a manually-started console has argv[0] = bare "pinga" (verified: pid cmdline = `pinga`), while the guard compared argv[0] against the FULL canonical path — no match → guard saw "free". The boot TUI window matches because it's `sh -c "exec '<exe>'"` (full path).
+- Fix: new `argv_is_pinga` helper — full path OR basename match (same convention as the provider adapters). Used by both `other_tui_in` and `ensure_session`'s TUI-present check (the latter had the same latent bug for resurrect-replayed windows). Tests: bare name, relative path, canonical path, near-miss names (pinga-tmux-save), empty argv.
+- ALSO: user's real tmux session is named `pinga`, but bring-up defaulted to `main` — at boot `pinga up` would have created a SECOND session alongside the resurrected one. Created ~/.config/pinga/config.toml with `tmux_session = "pinga"`.
+- Gates green: 140 tests, clippy -D warnings. Installed. The running console is still the OLD binary — quit+restart to pick up the guard fix.
+
+## [2026-10-03] FIX | Guard message shows tmux's index:name label, not the raw window id
+- User: the redirect worked but printed "window @2" while tmux's status bar shows "1:edgar". New `Tmux::window_label` (display-message -t <win> -p '#{window_index}:#{window_name}'); ConsoleGuard carries label (best-effort, None if tmux can't report); auto_mode prints the label with the @id as fallback.
+- Gates green: 140 tests, clippy -D warnings, installed to ~/.local/bin/pinga.
+
+## [2026-10-03] DESIGN | Bring-up never auto-launches; this session IS ses_f5416a
+- User's design choice (revises D12): a session not running in the tmux session must NOT be auto-relaunched by bring-up — it stays in the console's list, where the user relaunches it explicitly. Bring-up's reconcile now only verifies/adopts/repairs bookkeeping and REPORTS not-running records (`RestoreAction::NotRunning`); the launch branch (resume_plan + open_in_tmux_in) is removed. `Launched` variant removed; print_report prints "not running — reopen from the console's list".
+- Also corrected a wrong claim: ses_f5416a477ffef4yNuMa5BLYWlJ ("pinga - 2026-09-16T20:29:52.392Z", slug witty-rocket) IS THIS conversation — verified my own client process argv is `opencode -s ses_f5416a477ffef4yNuMa5BLYWlJ` (bare -s form). My earlier pgrep missed it because it grepped "opencode attach"; the bare `-s` client carries no "attach" token (the form the 2026-10-03 match fix recognizes). Record 9's window @5 is current; bring-up would have adopted it, not launched anything.
+- Gates green: 140 tests, clippy -D warnings, installed.
+
+## [2026-10-03] IMPL | Restore sessions into their pre-reboot windows (resurrect only brings back shells)
+- User's requirement: resurrect replays windows+shell history but never the agents; pinga must restart every session IN THE WINDOW IT WAS IN before interruption. New design: records carry a restore-stable window identity — (window_index, window_name), which tmux-resurrect replays while reassigning @ids.
+- Schema: TrackedRecord::Known gains #[serde(default)] window_index/window_name (additive, v2 stays; old files parse). Captured at record_launch + Plan::Adopt (best-effort, launcher.window_index_name). Backfill pass in reconcile for records lacking identity (live window lookup) — ran live: records 7/9/16 now carry idx 3 "markdown" / 2 "pinga" / 9 "yazi".
+- New Tmux seam methods: window_index_name, session_windows (id|index|name), respawn_pane (-k in place). Reconcile's no-match branch now tries restore_into_window: find the window by stored index/name, respawn the resume_plan command ONLY if the pane is an idle shell (single shell-rooted process — is_idle_shell); busy windows are refused (never kill user work); no identity/candidate → NotRunning (list, user relaunches). RestoreAction::Restored + report line "restarted in place".
+- Live `pinga up`: all 3 records adopted as already running; identities backfilled. Gates: 144 tests, clippy -D warnings, installed.
+
+## [2026-10-04] FIX | Boot troubleshooting round (first real reboot)
+Symptom: session+console came up, but only the pinga window; this conversation + markdown/yazi showed interrupted; codex sessions missing entirely.
+Root causes (all evidenced):
+1. tmux-resurrect restore silently did nothing at boot (journal shows service exit 0; `tmux run-shell` swallows restore.sh's failures). The script works standalone AND under systemd-run — boot-specific failure remains unexplained; now INSTRUMENTED (deploy/pinga-tmux-restore logs the save path, restore.sh output, and resulting sessions to the journal).
+2. opencode.service marked Started 10s before its HTTP listener came up (05:06:50 vs 05:07:11); pinga-up's 3x2s retry expired first. LIST_RETRIES 3 -> 15 (30s).
+3. With no restored windows, restore-into-window had nothing to restore into. New fallback: when the recorded window identity has no matching window, RECREATE it with the recorded name and start the session in it (tracked sessions now come back even without resurrect). Records 7/16 were already marked interrupted by the console (respected — user's choice to resume).
+4. Codex sessions were NEVER tracked (hand-opened; scan_attached is ephemeral). New auto-track: the console records any session observed running with exactly one Confirmed window (complete evidence only), capturing window identity — so hand-opened sessions survive reboots too. Test: observed_running_session_is_auto_tracked_and_never_duplicated.
+Schema: Known gains #[serde(default)] window_index/window_name (additive). Gates: 146 tests, clippy -D warnings, installed. Not committed.
+
+## [2026-10-04] FIX | Why records were dropped: the rename disease (user caught my error)
+- User corrected me: the codex sessions were opened RECENTLY (Oct 3 ~20:08-20:37, during restart testing), not in the distant past — and they WERE opened from pinga. Evidence: pre-reboot resurrect save names those windows "Ask DeepSeek for architecture report" etc., while the threads are now named "Trickster/Mundito/Yatagarasu architect" — the threads were RENAMED after opening. codex resume argv carries the OLD title; match_session compares against session.id/CURRENT title → no candidate → the reconcile's "window alive but not running_here, complete, not uncertain" branch REMOVED the record within hours of every rename.
+- Root mechanism (the "disease"): records are keyed by raw @id and the reconcile only inspects the RECORD's own window; anything that makes the provider return no candidate for that window (rename, reused window, id reassigned by a server restart) reads as "session ended" → silent drop, even while the session runs in that very window.
+- Fixes: (1) codex adapter — a resume target matching NO current session is Ambiguous (stale name could be ours), never a clean negative; a target that provably belongs to another snapshot session stays a clean negative. (2) app reconcile — before Remove in the alive-but-not-running_here branch, if the session has exactly one Confirmed match in ANOTHER window, re-point the record there (with fresh identity) instead of dropping.
+- Tests: renamed_thread_with_stale_resume_target_is_ambiguous_not_absent (codex), plus prior auto-track. Gates: 147 tests (3 consecutive clean runs), clippy -D warnings, installed.
+
+## [2026-10-04] IMPL | Rename consistency + agy provider enabled
+- User confirmed: the codex sessions were renamed BY HIM for meaningful names. Answer to "why does rename leave inconsistent state": rename already flows through the abstracted Provider::rename trait (D10) — opencode renames server-side via verified HTTP, codex writes threads.name in SQLite (the running app-server reads the SAME file, so the server is renamed; the client TUI may cache the old title in-memory — upstream behavior), agy honestly unsupported (recon: TUI-internal /rename; summary DB is a derived cache). The VISIBLE inconsistency was the tmux window label keeping the old name.
+- Fix: after a successful provider rename, pinga now also renames the tracked tmux window (rename-window, 24-char label convention) and refreshes the record's restore identity — `rename_tracked_window`. New Tmux::rename_window seam. Test: rename_also_renames_the_tracked_window_and_refreshes_identity.
+- codex app-server control-socket rename (so the RUNNING client updates): not attempted — recon (D3/§5.2) found the protocol IDE-oriented; the DB write reaches the server. Bounded recon proposed as follow-up if the user wants the live client's in-memory title to change.
+- agy provider ENABLED: ~/.config/pinga/config.toml now lists explicit providers (opencode/codex/agy antigravity home ~/.gemini/antigravity-cli) — agy 1.2.9 installed. Restart pinga to pick it up.
+- Gates: 148 tests, clippy -D warnings, installed.
+
+## [2026-10-04] IMPL | Aliases + resurrect handshake + codex rename recon
+- Aliases (the "not blindsided by my own rename" fix): TrackedRecord::Known gains #[serde(default)] aliases; rename_tracked_window stores the OLD title; new Provider::match_session_aliased (default = match_session) lets the codex adapter confirm a `resume <target>` whose target is one of pinga's recorded old names; reconcile + compute_running use it, so a renamed session stays CONFIRMED (running group) instead of falling to ambiguous/closed while its client still runs under the old argv title.
+- Resurrect handshake (user's requirement): when `pinga` (outside tmux) finds no session, it asks FIRST via the new injectable Resurrect seam (Launcher::with_resurrect; real = systemctl --user start pinga-tmux-restore.service, blocking on the oneshot); the deploy script now writes ~/.local/state/pinga/restore-status.txt (OK n sessions / FAIL reason / SKIP reason); pinga reads it, reports it ("resurrect service: …"), and only falls back to creating its own session when the service failed. If the resurrect brought the session up, pinga skips creation entirely.
+- codex rename recon: the 0.160 app-server protocol (generate-json-schema + strings) HAS ThreadSetName{name,threadId} + ThreadNameUpdatedNotification (pushed to running clients) + `codex app-server proxy` to inject bytes; Initialize handshake required. Wire framing unknown (newline-JSON got no echo) — follow-up spike before implementing server-side rename.
+- agy: registry builds fine with the explicit config; the third column exists but the viewport shows 2 columns — wrap focus to see it.
+- Gates: 149 tests, clippy -D warnings, installed.
+
+## [2026-10-04] FIX | "create window failed: index N in use" (tmux renumber quirk)
+- Symptom: after quitting the console (its window closed, leaving indexes [1,2] with 0 free), `pinga` outside tmux failed with `tmux new-window failed: create window failed: index 1 in use`; user had to attach manually. Reproduced with a bare `tmux new-window -t pinga`.
+- Root cause: with `renumber-windows on`, after a window closes tmux's internal next-index counter points at an occupied index (1) while 0 is actually free — plain `new-window -t <session>` dies.
+- Fix: `TmuxCli::new_window` now computes a gap-filling free index itself (list-windows indexes -> `next_free_index`, pure fn + unit test) and creates via `-t <session>:<index>`; falls back to tmux's choice if the listing can't be read.
+- Verified live: console recreated at index 0. Gates: 150 tests, clippy -D warnings, installed.
+
+## [2026-10-04] FIX | Kill-server test: resurrect WORKED; conversation missed by index collision
+- User's test: I killed the tmux server; user invoked `pinga` to recreate. User concluded resurrect failed; the journal proves otherwise: pinga-tmux-restore.service restored `pinga: 3 window(s)` at 06:24:42 (status "OK 1 sessions"). What didn't come back was the conversation CLIENT — resurrect replays shells — and pinga's restore-in-place then missed it: the record's identity (idx 1, name "pinga - 2026-09-16T20:29") collided with the FRESH session's console (base-index 1 → console at index 1, name "pinga"); the index-only match found a busy window → Deferred forever → user restarted the conversation manually (record 19). Codex was recreated via the create-fallback (record 18 -> idx 0 "Pinga architect", running).
+- Fix: restore_into_window now distinguishes name-match (strong) from index-only (weak): name+busy -> Deferred (never kill); index-only+busy -> fall through to create-fallback with the recorded name (a live client would have been adopted earlier). Test: index_collision_with_a_busy_console_falls_back_to_recreation.
+- Gates: 151 tests, clippy -D warnings, installed. renumber-windows set off in ~/.config/tmux/tmux.conf (line 69) + live server.
+
+## [2026-10-04] ROOT CAUSE FOUND | systemd kills the restore service's tmux server (cgroup teardown)
+- The user's drill (kill server -> invoke pinga) + the 06:24 report ("no server running" twice, yet the service journal showed pinga: 3 window(s) and status OK) exposed the real bug behind EVERY "resurrect did nothing" mystery: systemd user ONESHOT units tear down their cgroup when the unit completes — killing any tmux server the script spawned. At boot (05:06) the restored layout died with the unit; at 06:24 the 3 restored windows died ~1s after restore.
+- Proven with isolated tests: default KillMode -> fresh server dead after unit finishes; KillMode=process -> still dead; RemainAfterExit=yes -> unit stays active(exited), server SURVIVES. (Earlier -S tests were invalid: tmux can't create the socket dir when the parent was rm'd — the "deaths" were never-started servers.)
+- Fix: pinga-tmux-restore.service gains RemainAfterExit=yes. Deployed + daemon-reloaded.
+- Also confirmed the collision fix works live: the user's 06:46:36 `pinga` brought back console + codex + THIS conversation automatically (create-fallback), all 3 windows alive (attached).
+- Note to self: my shell's $TMUX overrides TMUX_TMPDIR; and I twice killed the user's real server with tmux kill-server while probing — never run kill-server without -S and a real isolation check.
+
+## [2026-10-04] IMPL | Console is always the session's first window
+- User: "when pinga restores the windows, it should make sure to put itself in the first one." ensure_session now returns the FOUND console window id (not just created); bring_up ends by move_window_to_front (tmux move-window -t <session>:0, no-op when already first). New Tmux seam + test (bring_up_moves_the_console_to_the_first_window). 152 tests, clippy clean, installed.
+
+## [2026-10-04] FIX | resurrect request was a silent no-op (systemctl start on active(exited) unit)
+- The definitive cold-start drill mostly passed: the session came back in the same window order, console running, both agents back. But the RESTORE itself never ran at 06:51 — pinga created the session itself. Cause: with RemainAfterExit=yes the unit stays active(exited) after the 06:46 run, and `systemctl start` on an already-active unit is a no-op that does NOT re-run ExecStart.
+- Fix: request_resurrect now uses `systemctl --user restart pinga-tmux-restore.service` (re-runs even when active(exited); identical to start when inactive). Note: the 06:58 service run restored INTO the already-existing session without damage — restart-on-bring-up is safe.
+- Also noted: the move-to-front fix wasn't exercised (the 06:51 pinga predated it; the 06:58 invocation was inside tmux → guard redirect). Next outside bring-up will move the console to index 0.
+- Gates: 152 tests, clippy clean, installed.
+
+## [2026-10-04] FIX | Console deaths during drills — resolved via the resurrect-success TUI check
+- Symptom: consoles created during cold drills (kill server -> invoke pinga) came up and then exited cleanly (no error, no exit-log entry). Killed the ssh AND eris drills; my own synthetic drills survived, so I instrumented console-exit.log (unconditional) + phase logs + a strace watcher on every pinga process.
+- Findings: the 07:32 drill's console DID log a full startup ("app.run() entered") and never returned -> mid-run kill. But the full service timeline showed each drill restoring fine; the resurrect-success path in ensure_session returned EARLY (Ok(false, None, resurrect)) WITHOUT the TUI check — so post-restore drills either created the console in a different flow or not at all ("pinga is dead" was sometimes 'no console at all').
+- Fix: ensure_session's resurrect-success path now falls through to a shared ensure_tui_window (verify console argv, create if missing) — every drill creates the console identically via new_window into the restored session.
+- RESULT: the next drill's console SURVIVED (3+ min watch, past every previous death window, zero signals, full startup logged, strace armed). Console alive at 0:pinga; window order: 0:pinga, 2:conversation, 4:codex (+ leftover 3:pinga corpse shell, user may tidy).
+- Instrumentation kept: console-exit.log (unconditional), quit-key logging, phase logs; strace watcher in /tmp/opencode/trace stays armed for the next death, if any.
+- Gates: 152 tests, clippy clean, installed.
