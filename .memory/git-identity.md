@@ -139,3 +139,19 @@ git rev-parse --abbrev-ref master@{upstream}   # expect: origin/master
 `origin` here is `https://github.com/jergas/pinga.git` and `origin/master` is
 `a92cb7e`, 8 commits behind local `master`. So the push that follows is a normal
 fast-forward — no force, and no fork needed.
+
+## Resolution (2026-10-07, Omarchy)
+
+- Identity set: `git config --global user.name "Jergas Apwith"` /
+  `git config --global user.email "2859532+jergas@users.noreply.github.com"`.
+  With no `~/.gitconfig` present, the write landed in the XDG global config
+  (`~/.config/git/config`) — which in fact already held a `[user]` section with
+  `spam@jerx.net` (the earlier note claimed it had none; that was wrong, and it
+  is exactly where the old author came from). The value was overwritten in
+  place; `git var GIT_AUTHOR_IDENT` now resolves to the noreply address.
+- The 8 unpushed commits AND the NixOS-side docs commit were re-authored with
+  `git rebase --exec 'git commit --amend --no-edit --reset-author' @{u}` —
+  all authors are now the noreply address.
+- The NixOS agent's execute-check fix (PR #1, `a730527`) was cherry-picked
+  onto the re-authored master (`87327ae`); PR #1 was closed as consumed.
+  History is now single-identity and fast-forward pushable from `a92cb7e`.

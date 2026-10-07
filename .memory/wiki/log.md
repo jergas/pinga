@@ -570,3 +570,9 @@ Schema: Known gains #[serde(default)] window_index/window_name (additive). Gates
 - Reason for the switch: `spam@jerx.net` is unverified on the GitHub account, so commits with it were never attributed to the profile. Documented the `sudo git config --global` → `/root/.gitconfig` trap.
 - 8 unpushed commits on `master` still carry the old address; re-authorable with `git rebase --exec '...' @{u}` (no force-push needed). NOT done — awaiting a decision.
 - Added `.memory/git-identity.md` plus a gotchas entry. No code touched, nothing committed.
+
+## [2026-10-07] FIX | NixOS blockers resolved + git identity unified (re: Space Bunny's brief)
+- Identity: Omarchy git identity set to the noreply address (writes landed in the XDG config, which in fact held the old spam@jerx.net [user] — the earlier "no [user] section" claim was wrong; that's where the old author came from). Re-authored all 9 unpushed commits (8 + NixOS docs) via rebase --reset-author; all now noreply.
+- The execute-check fix from PR #1 (a730527) cherry-picked as 87327ae; PR #1 closed as consumed.
+- NixOS blockers: linux release artifact is now x86_64-unknown-linux-musl (static, runs on glibc and musl distros; CI verifies on the first tag); all three units gained Environment=PATH with /run/current-system/sw/bin + %h/.local/bin (deployed + daemon-reload verified).
+- Gates: 158 tests, clippy clean. Next: push master (fast-forward from a92cb7e), then the v* tag → real release → installer gate on a second host.

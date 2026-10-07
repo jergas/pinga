@@ -86,3 +86,15 @@ evidence.
 - **Whether to pursue NixOS as a supported platform.** Stated intent is that every
   system should be supported. That needs the musl artifact, not just the honest
   failure.
+
+## Resolution (2026-10-07, Omarchy)
+
+- The execute-check fix (PR #1) was cherry-picked onto the re-authored
+  history as `87327ae`; PR #1 closed as consumed.
+- Blocker 1 (no musl artifact) fixed: the Linux build in the release workflow
+  now produces `x86_64-unknown-linux-musl` (static; runs on glibc AND musl
+  distros incl. NixOS). Verification happens in CI on the first tagged run.
+- Blocker 2 (unit PATH) fixed: all three units carry
+  `Environment=PATH=/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:%h/.local/bin`.
+- The honest gate remains: tag `v*`, then run `sh deploy/install.sh` with no
+  `PINGA_BASE_URL` on a second host.
