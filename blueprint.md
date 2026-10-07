@@ -5414,7 +5414,8 @@ pub const LIST_RETRIES: u32 = 15;
 pub const LIST_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// Full bring-up: ensure the tmux session + pinga TUI window, then reconcile
-/// every tracked record against live evidence.
+/// every tracked record against live evidence. A machine without tmux (e.g. a
+/// mac thin client) fails here with a clear pointer to the remote flow.
 pub fn bring_up(
     launcher: &Launcher,
     providers: &ProviderRegistry,
@@ -5422,7 +5423,15 @@ pub fn bring_up(
     exe: &Path,
     session: &str,
 ) -> Result<BringUpReport> {
-    let (session_created, pinga_window, resurrect) = ensure_session(launcher, exe, session)?;
+    let (session_created, pinga_window, resurrect) = match ensure_session(launcher, exe, session) {
+        Ok(v) => v,
+        Err(e) if is_tmux_missing(&e) => {
+            return Err(anyhow!(
+                "tmux is not installed on this machine (needed to bring the session up). \
+                 On a client machine, use `pinga remote connect <name>` (or `pinga remote list`)."));
+        }
+        Err(e) => return Err(e),
+    };
     let records = store.read()?;
     let actions = reconcile(launcher, providers, store, &records, session,
                             LIST_RETRIES, LIST_RETRY_DELAY)?;
@@ -5433,6 +5442,13 @@ pub fn bring_up(
     }
     Ok(BringUpReport { session: session.into(), session_created, pinga_window,
                        resurrect, actions })
+}
+
+/// Whether the error is a failed `tmux` spawn (executable not found — e.g.
+/// macOS thin clients) rather than an operational tmux failure.
+pub fn is_tmux_missing(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<std::io::Error>()
+        .map(|io| io.kind() == std::io::ErrorKind::NotFound).unwrap_or(false))
 }
 
 /// The TUI window command: POSIX `sh -c "exec '<exe>'"`, so process inspection
@@ -6012,6 +6028,18 @@ mod tests {
     }
 
     #[test]
+    fn missing_tmux_is_detected_as_a_missing_executable_not_an_io_failure() {
+        use anyhow::Context;
+        // A failed spawn of a missing executable carries io::ErrorKind::NotFound
+        // in the chain (e.g. `tmux` absent on a mac thin client).
+        let spawn_err = std::io::Error::from_raw_os_error(2);
+        let wrapped = anyhow!("tmux failed").context(spawn_err);
+        assert!(is_tmux_missing(&wrapped), "spawn ENOENT is 'tmux missing'");
+        let other = anyhow!("tmux new-window failed: index 1 in use");
+        assert!(!is_tmux_missing(&other), "operational failures are not 'missing'");
+    }
+
+    #[test]
     fn missing_session_asks_resurrect_first_and_falls_back() {
         // The user's requirement: with no session, pinga must ask the systemd
         // restore service first and act on its report — only if that fails
@@ -6446,6 +6474,249 @@ mod tests {
         let l = launcher_with(Arc::clone(&tmux), HashMap::from([procs(50, vec!["sh"])]));
         assert!(guard_console(&l, "main", &exe()).unwrap().is_none());
         assert!(tmux.selected().is_empty(), "nothing selected when free");
+    }
+}
+```
+
+### 11.8d Remote connection manager (`core::remote`)
+
+Roadmap priority 1 — the thin client. pinga manages connections to remote
+hosts (e.g. a mac reaching eris) so the user never types `ssh` by hand: pinga
+generates a per-host ed25519 key, installs its public half, tests the
+connection with a `BatchMode` probe, and connects by running the REMOTE's own
+`pinga` over `ssh -t` (which brings the remote console up and attaches).
+
+Remotes live in a pinga-owned file `~/.config/pinga/remotes.toml` (separate
+from `config.toml` because pinga must WRITE it; users may hand-edit too).
+Every ssh invocation is built as an explicit argv — never a shell fragment, so
+no remote/user string is ever interpreted by a shell. All argv builders are
+pure functions returning `Vec<String>`, which the CLI runs with
+`Command::new` — fully unit-testable without touching real ssh.
+
+``` {.rust #core-remote path="src/remote.rs"}
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// One configured remote host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Remote {
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Explicit key path; defaults to `~/.ssh/pinga-<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemotesFile {
+    #[serde(default)]
+    pub remotes: Vec<Remote>,
+}
+
+/// The pinga-owned remotes file path.
+pub fn remotes_path() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("pinga/remotes.toml")
+}
+
+/// Load remotes; a missing file is an empty list, malformed TOML is an error.
+pub fn load(path: &Path) -> Result<Vec<Remote>> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(toml::from_str::<RemotesFile>(&raw)
+            .with_context(|| format!("parse {}", path.display()))?.remotes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(anyhow!("read {}: {e}", path.display())),
+    }
+}
+
+/// Persist the full list (pinga owns this file; atomic temp+rename).
+pub fn save(path: &Path, remotes: &[Remote]) -> Result<()> {
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let file = RemotesFile { remotes: remotes.to_vec() };
+    let body = toml::to_string_pretty(&file)?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &body)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Valid name: lowercase-ish letters/digits/`-`/`_`/`.` (it lands in a file
+/// name and in ssh comments; never allow whitespace or shell metacharacters).
+pub fn validate_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if ok { Ok(()) } else { Err(anyhow!("invalid remote name {name:?}")) }
+}
+
+impl Remote {
+    /// The private key path: explicit or `~/.ssh/pinga-<name>`.
+    pub fn key_path(&self) -> PathBuf {
+        self.key.clone().unwrap_or_else(|| {
+            dirs::home_dir().unwrap_or_default().join(format!(".ssh/pinga-{}", self.name))
+        })
+    }
+
+    /// The public key path (`<key>.pub`).
+    pub fn public_key_path(&self) -> PathBuf {
+        let mut p = self.key_path();
+        p.set_extension("pub");
+        p
+    }
+
+    fn base_argv(&self, extra: &[&str]) -> Vec<String> {
+        let mut v = vec!["ssh".into(), "-i".into(), self.key_path().to_string_lossy().into_owned()];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        if let Some(port) = self.port {
+            v.push("-p".into());
+            v.push(port.to_string());
+        }
+        v.push(format!("{}@{}", self.user, self.host));
+        v
+    }
+
+    /// BatchMode probe: succeeds only when the key actually works.
+    pub fn test_argv(&self) -> Vec<String> {
+        let mut v = self.base_argv(&["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
+        v.push("true".into());
+        v
+    }
+
+    /// Connect: run the REMOTE's own pinga (bring-up + console) over `ssh -t`.
+    pub fn connect_argv(&self) -> Vec<String> {
+        let mut v = self.base_argv(&["-t"]);
+        v.push("pinga".into());
+        v
+    }
+
+    /// Install the public key via ssh-copy-id (interactive on first use).
+    pub fn install_argv(&self) -> Vec<String> {
+        let mut v = vec!["ssh-copy-id".into()];
+        if let Some(port) = self.port {
+            v.push("-p".into());
+            v.push(port.to_string());
+        }
+        v.push("-i".into());
+        v.push(self.public_key_path().to_string_lossy().into_owned());
+        v.push(format!("{}@{}", self.user, self.host));
+        v
+    }
+
+    /// Generate the per-host ed25519 key if missing; returns whether it
+    /// created one. Never overwrites an existing key.
+    pub fn keygen_if_missing(&self) -> Result<bool> {
+        let key = self.key_path();
+        if key.exists() { return Ok(false); }
+        if let Some(parent) = key.parent() { std::fs::create_dir_all(parent)?; }
+        let argv = vec![
+            "ssh-keygen".to_string(),
+            "-t".into(), "ed25519".into(),
+            "-N".into(), "".into(),
+            "-f".into(), key.to_string_lossy().into_owned(),
+            "-C".into(), format!("pinga {}", self.name),
+        ];
+        let status = Command::new(&argv[0]).args(&argv[1..]).status()
+            .context("spawn ssh-keygen")?;
+        if !status.success() { return Err(anyhow!("ssh-keygen failed")); }
+        Ok(true)
+    }
+}
+
+/// Run an argv and return its exit status (inherit stdio — interactive
+/// commands like ssh-copy-id and ssh -t need the terminal).
+pub fn run_argv(argv: &[String]) -> Result<std::process::ExitStatus> {
+    let status = Command::new(&argv[0]).args(&argv[1..]).status()
+        .with_context(|| format!("spawn {}", argv[0]))?;
+    Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("pinga-remote-{}-{}",
+                std::process::id(), std::time::SystemTime::now().duration_since(
+                    std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+        fn path(&self) -> &Path { &self.0 }
+    }
+    impl Drop for TempDir { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+    fn remote(name: &str) -> Remote {
+        Remote { name: name.into(), host: "eris".into(), user: "edgar".into(),
+                 port: None, key: None }
+    }
+
+    #[test]
+    fn missing_remotes_file_is_empty_and_save_roundtrips() {
+        let td = TempDir::new();
+        let path = td.path().join("remotes.toml");
+        assert!(load(&path).unwrap().is_empty(), "missing file -> empty");
+        save(&path, &[remote("eris"), remote("pi")]).unwrap();
+        assert_eq!(load(&path).unwrap(), vec![remote("eris"), remote("pi")]);
+        // Save is atomic: no leftover tmp file.
+        assert!(!path.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn malformed_remotes_file_is_an_error() {
+        let td = TempDir::new();
+        let path = td.path().join("remotes.toml");
+        fs::write(&path, "not toml [[[").unwrap();
+        assert!(load(&path).is_err());
+    }
+
+    #[test]
+    fn key_path_defaults_to_ssh_pinga_name_and_explicit_key_wins() {
+        assert!(remote("eris").key_path().ends_with(".ssh/pinga-eris"));
+        let explicit = Remote { name: "eris".into(), host: "h".into(), user: "u".into(),
+                                port: Some(2222), key: Some(PathBuf::from("/tmp/k")) };
+        assert_eq!(explicit.key_path(), PathBuf::from("/tmp/k"));
+        assert_eq!(explicit.public_key_path(), PathBuf::from("/tmp/k.pub"));
+    }
+
+    #[test]
+    fn argv_builders_are_explicit_and_never_interpolated_by_a_shell() {
+        let r = Remote { name: "eris".into(), host: "100.115.173.85".into(),
+                         user: "edgar".into(), port: Some(22), key: None };
+        // Each token is a separate argv element: no shell can reinterpret it.
+        assert_eq!(r.test_argv(),
+            vec!["ssh", "-i", "/home/edgar/.ssh/pinga-eris",
+                 "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                 "-p", "22", "edgar@100.115.173.85", "true"]);
+        assert_eq!(r.connect_argv(),
+            vec!["ssh", "-i", "/home/edgar/.ssh/pinga-eris",
+                 "-t", "-p", "22", "edgar@100.115.173.85", "pinga"]);
+        assert_eq!(r.install_argv(),
+            vec!["ssh-copy-id", "-p", "22", "-i", "/home/edgar/.ssh/pinga-eris.pub",
+                 "edgar@100.115.173.85"]);
+    }
+
+    #[test]
+    fn keygen_only_when_missing_and_name_validation() {
+        let td = TempDir::new();
+        let r = Remote { name: "x".into(), host: "h".into(), user: "u".into(),
+                         port: None, key: Some(td.path().join("k")) };
+        // First call creates, second is a no-op (never overwrites).
+        assert!(r.keygen_if_missing().unwrap());
+        assert!(!r.keygen_if_missing().unwrap());
+        assert!(r.key_path().exists());
+        // ssh-keygen may be absent in minimal environments; the pure logic
+        // (missing -> create path) is what this asserts, creation itself is
+        // best-effort here.
+        assert!(validate_name("eris-2").is_ok());
+        assert!(validate_name("bad name").is_err());
+        assert!(validate_name("a;b").is_err());
+        assert!(validate_name("").is_err());
     }
 }
 ```
@@ -10417,6 +10688,7 @@ mod launcher;
 mod model;
 mod naming;
 mod provider;
+mod remote;
 mod tracking;
 mod tui;
 
@@ -10441,15 +10713,108 @@ fn main() -> anyhow::Result<()> {
             print_report(&report);
             Ok(())
         }
+        ["remote", sub, rest @ ..] => remote_command(sub, rest),
         ["-h"] | ["--help"] => {
             println!("pinga — session console for opencode & codex");
-            println!("usage: pinga [up]");
-            println!("  (no args)  run the console; outside tmux: bring the");
-            println!("             tmux session up, then attach");
-            println!("  up         headless bring-up (systemd boot unit)");
+            println!("usage: pinga [up|remote <command>]");
+            println!("  (no args)    run the console; outside tmux: bring the");
+            println!("               tmux session up, then attach");
+            println!("  up           headless bring-up (systemd boot unit)");
+            println!("  remote list | add <name> <host> [user] | keygen <name> |");
+            println!("               install-key <name> | test <name> | connect <name>");
             Ok(())
         }
-        _ => Err(anyhow::anyhow!("usage: pinga [up]")),
+        _ => Err(anyhow::anyhow!("usage: pinga [up|remote <command>]")),
+    }
+}
+
+/// Thin-client remote management (roadmap priority 1). Every ssh invocation is
+/// built as an explicit argv and run with inherited stdio — interactive
+/// commands (ssh-copy-id, ssh -t) need the terminal.
+fn remote_command(sub: &str, args: &[&str]) -> anyhow::Result<()> {
+    let path = remote::remotes_path();
+    let mut remotes = remote::load(&path)?;
+    let find = |name: &str| -> anyhow::Result<remote::Remote> {
+        remotes.iter().find(|r| r.name == name).cloned()
+            .ok_or_else(|| anyhow::anyhow!("no remote named {name:?} (see `pinga remote add`)"))
+    };
+    match sub {
+        "list" => {
+            if remotes.is_empty() {
+                println!("no remotes configured (add one: `pinga remote add <name> <host> [user]`)");
+            }
+            for r in &remotes {
+                let ok = remote::run_argv(&r.test_argv())
+                    .map(|s| s.success()).unwrap_or(false);
+                println!("{} — {}@{}:{} — key {} — {}",
+                    r.name, r.user, r.host,
+                    r.port.map(|p| p.to_string()).unwrap_or_else(|| "22".into()),
+                    r.key_path().display(),
+                    if ok { "ok" } else { "not reachable (run install-key)" });
+            }
+            Ok(())
+        }
+        "add" => {
+            let (name, host, user) = match args {
+                [name, host] => (*name, *host, std::env::var("USER").unwrap_or_else(|_| "root".into())),
+                [name, host, user] => (*name, *host, user.to_string()),
+                _ => return Err(anyhow::anyhow!("usage: pinga remote add <name> <host> [user]")),
+            };
+            remote::validate_name(name)?;
+            if remotes.iter().any(|r| r.name == name) {
+                return Err(anyhow::anyhow!("remote {name:?} already exists"));
+            }
+            remotes.push(remote::Remote { name: name.into(), host: host.into(), user: user.clone(),
+                                      port: None, key: None });
+            remote::save(&path, &remotes)?;
+            println!("added remote {name} ({user}@{host}); next: `pinga remote keygen {name}`");
+            Ok(())
+        }
+        "keygen" => {
+            let name = single_arg(args, "keygen <name>")?;
+            let r = find(name)?;
+            let created = r.keygen_if_missing()?;
+            println!("{} key at {} ({})",
+                if created { "generated" } else { "using existing" },
+                r.key_path().display(),
+                if r.public_key_path().exists() { "public key present" } else { "public key missing" });
+            Ok(())
+        }
+        "install-key" => {
+            let name = single_arg(args, "install-key <name>")?;
+            let r = find(name)?;
+            if !r.public_key_path().exists() {
+                return Err(anyhow::anyhow!("no public key yet — run `pinga remote keygen {name}` first"));
+            }
+            println!("installing {} on {} — type the remote password if prompted",
+                r.public_key_path().display(), r.host);
+            let status = remote::run_argv(&r.install_argv())?;
+            if status.success() { println!("key installed"); Ok(()) }
+            else { Err(anyhow::anyhow!("ssh-copy-id failed (exit {status})")) }
+        }
+        "test" => {
+            let name = single_arg(args, "test <name>")?;
+            let r = find(name)?;
+            let ok = remote::run_argv(&r.test_argv()).map(|s| s.success()).unwrap_or(false);
+            if ok { println!("{name}: reachable"); Ok(()) }
+            else { Err(anyhow::anyhow!("{name}: not reachable — run `pinga remote install-key {name}`")) }
+        }
+        "connect" => {
+            let name = single_arg(args, "connect <name>")?;
+            let r = find(name)?;
+            println!("connecting to {name} ({}@{})…", r.user, r.host);
+            let status = remote::run_argv(&r.connect_argv())?;
+            if status.success() { Ok(()) }
+            else { Err(anyhow::anyhow!("connection to {name} failed (exit {status})")) }
+        }
+        other => Err(anyhow::anyhow!("unknown remote command {other:?} — see `pinga --help`")),
+    }
+}
+
+fn single_arg<'a>(args: &[&'a str], usage: &str) -> anyhow::Result<&'a str> {
+    match args {
+        [one] => Ok(*one),
+        _ => Err(anyhow::anyhow!("usage: pinga remote {usage}")),
     }
 }
 

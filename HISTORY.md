@@ -55,3 +55,6 @@ truth.
   window no-swap park, renumber quirk defeat, console exit telemetry.
 - Rename resilience: alias matching keeps renamed sessions running; tmux
   window labels follow renames; auto-track keeps hand-opened sessions tracked.
+- Thin client: remote connection manager — per-host ssh keys, key
+  installation, BatchMode probes, and `pinga remote connect` into a remote
+  console (validated mac → eris).

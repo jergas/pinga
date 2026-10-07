@@ -555,3 +555,6 @@ Schema: Known gains #[serde(default)] window_index/window_name (additive). Gates
 - Mac `make install` produced "zsh: exec format error": target/ was synced by Syncthing (sync root = ~/projects, no .stignore), so the mac installed eris's Linux ELF. Fix: /pinga/target in ~/projects/.stignore (per-device — mac needs its own), and Makefile portable for BSD install (mkdir -p + -m, no -D) + units only deployed when systemctl exists (mac prints a note only).
 - Second mac issue: bare `pinga` failed with raw spawn ENOENT (no tmux on macOS). Fix: bring_up detects io::ErrorKind::NotFound in the error chain (is_tmux_missing, unit-tested) and prints "tmux is not installed on this machine... use `pinga remote connect <name>`". Verified by simulating PATH without tmux.
 - Next: mac flow = remote add eris 100.115.173.85 edgar -> install-key (password once) -> connect.
+
+## [2026-10-04] ACCEPT | Thin client validated mac -> eris
+- User ran `pinga remote add eris` / `install-key` / `connect` on the mac (Syncthing-synced source, CARGO_TARGET_DIR not needed after the target/ .stignore, BSD-install portability fix, missing-tmux friendly message): `pinga remote connect eris` landed in the eris console. Initial milestone accepted; HISTORY entry added; roadmap marked accepted.
