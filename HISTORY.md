@@ -60,3 +60,7 @@ truth.
   console (validated mac → eris).
 - Repository governance: AGPLv3-or-later LICENSE, roadmap, HISTORY changelog
   policy, README rewrite, agent changelog policy.
+- Installer and release pipeline: one POSIX installer fetching per-OS release
+  artifacts (static musl Linux + both macOS arches) from GitHub Releases, with
+  execute-testing and unit deployment; first release v0.1.0 live and verified
+  through the default download path.

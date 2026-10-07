@@ -38,7 +38,11 @@ Steps: push to a GitHub remote; README/AGENTS polish; an installer script
 (build the release, install the binary, deploy the systemd units and enable
 them) suitable for a fresh machine and for the mac; document the boot chain and
 the drill (`kill tmux server` → `pinga`). A release tag per milestone once the
-installer is stable.
+installer is stable. Accepted 2026-10-07: repo at github.com/jergas/pinga,
+v0.1.0 released via the tag workflow (static musl Linux + both macOS arches),
+installer verified through the default `releases/latest/download` path on Omarchy
+and the installer logic on NixOS; remaining gate: run the default-path installer
+on NixOS and the mac, then future releases are tag-only.
 
 ## 3. codex server-side rename spike
 

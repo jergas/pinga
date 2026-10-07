@@ -576,3 +576,9 @@ Schema: Known gains #[serde(default)] window_index/window_name (additive). Gates
 - The execute-check fix from PR #1 (a730527) cherry-picked as 87327ae; PR #1 closed as consumed.
 - NixOS blockers: linux release artifact is now x86_64-unknown-linux-musl (static, runs on glibc and musl distros; CI verifies on the first tag); all three units gained Environment=PATH with /run/current-system/sw/bin + %h/.local/bin (deployed + daemon-reload verified).
 - Gates: 158 tests, clippy clean. Next: push master (fast-forward from a92cb7e), then the v* tag → real release → installer gate on a second host.
+
+## [2026-10-07] ACCEPT | v0.1.0 released; installer verified via the default URL
+- CI fixes: tangle before build (src/ gitignored); both macOS arches cross-built on the arm64 mac runner (no Intel-mac queue); checksum the asset-named copy (installer verify matches). Run 37626395102 all green.
+- Release v0.1.0 live at github.com/jergas/pinga: pinga-linux-x86_64 (static musl), macos-aarch64, macos-x86_64, deploy bundle, all with .sha256.
+- Live default-path test on Omarchy: download → execute-check "verified pinga 0.1.0" → install → units enabled → `static-pie linked, statically linked` binary → pinga 0.1.0 runs.
+- Remaining gate for the user: run the default installer on NixOS and the mac; thereafter releases are tag-only.
