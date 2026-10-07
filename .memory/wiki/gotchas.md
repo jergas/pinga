@@ -145,3 +145,19 @@ open — close and reopen such windows via pinga.
 (stale ids after tmux-resurrect restore). A dead window's pane lookup failed
 and marked the whole snapshot incomplete → EVERY open refused ("cannot inspect
 running windows right now"). Fixed: only alive tracked windows are scanned.
+
+## eris: git identity differs between the NixOS and Omarchy installs (2026-10-06)
+eris is dual-booted and git identity is per-`$HOME`, so the two installs
+disagree. NixOS (`$HOME=/home/jergas`) is set to
+`Jergas Apwith <2859532+jergas@users.noreply.github.com>` in `~/.gitconfig`.
+Omarchy (`$HOME=/home/edgar`) has **no `~/.gitconfig`** and no `[user]` section
+in its XDG `~/.config/git/config`, so it has no configured identity at all. No
+`GIT_AUTHOR_*`/`GIT_COMMITTER_*` env vars exist anywhere, so a config file does
+take effect (env would otherwise win). `master` is also 8 unpushed commits
+authored with the previous `spam@jerx.net`, which is not verified on the GitHub
+account and therefore never linked commits to the profile.
+
+Two traps: `sudo git config --global` writes `/root/.gitconfig` (sudo resets
+`HOME`) and silently configures nothing; and running git against this repo from
+NixOS reads `/home/jergas/.gitconfig`, so the repo *looks* configured even while
+Omarchy is not. Full detail and the safe commands: `.memory/git-identity.md`.

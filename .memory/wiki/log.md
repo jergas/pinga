@@ -564,3 +564,9 @@ Schema: Known gains #[serde(default)] window_index/window_name (additive). Gates
 - .github/workflows/release.yml: on v* tags builds linux-x86_64 (ubuntu), macos-x86_64 (macos-13), macos-aarch64 (macos-latest), packages deploy bundle, assembles unversioned assets (+ .sha256) so /releases/latest/download works, creates the release with notes.
 - pinga --version added (CARGO_PKG_VERSION). Tested end-to-end on eris via a local http server: binary install + checksum verify + unit deployment (both paths). Gates: 158 tests (one unrelated browse concurrency flake), clippy clean.
 - NOT yet done: push to origin (github.com/jergas/pinga) + first v* tag + live release run. HISTORY entry pending the first real release.
+
+## [2026-10-06] NOTE | Documented the dual-install git identity split on eris
+- eris is dual-booted (NixOS + Omarchy) and git identity is per-`$HOME`. NixOS now uses `2859532+jergas@users.noreply.github.com` globally; Omarchy (`$HOME=/home/edgar`) has no `~/.gitconfig` and no `[user]` in its XDG git config, so it has no identity configured. Verified no `GIT_*` identity env vars exist, so a config file will take effect.
+- Reason for the switch: `spam@jerx.net` is unverified on the GitHub account, so commits with it were never attributed to the profile. Documented the `sudo git config --global` → `/root/.gitconfig` trap.
+- 8 unpushed commits on `master` still carry the old address; re-authorable with `git rebase --exec '...' @{u}` (no force-push needed). NOT done — awaiting a decision.
+- Added `.memory/git-identity.md` plus a gotchas entry. No code touched, nothing committed.
