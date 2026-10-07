@@ -42,6 +42,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }}
           rustup target add ${{ matrix.target }}
+      - name: tangle the literate source
+        # src/ is gitignored (derived from blueprint.md), so a fresh checkout
+        # has no targets; regenerate before building.
+        run: python3 tools/tangle.py blueprint.md
       - run: cargo build --release ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
       - name: package asset + checksum
         run: |
