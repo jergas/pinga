@@ -24,28 +24,25 @@ jobs:
             asset: pinga-linux-x86_64
             target: x86_64-unknown-linux-musl
             build_dir: target/x86_64-unknown-linux-musl/release
-            extra_target: ""
             pkgs: musl-tools
           - os: macos-latest
             asset: pinga-macos-aarch64
             target: ""
             build_dir: target/release
-            extra_target: ""
             pkgs: ""
           - os: macos-latest
             asset: pinga-macos-x86_64
             target: x86_64-apple-darwin
             build_dir: target/x86_64-apple-darwin/release
-            extra_target: x86_64-apple-darwin
             pkgs: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: install musl toolchain or extra target
-        if: matrix.extra_target != '' || matrix.pkgs != ''
+        if: matrix.target != '' || matrix.pkgs != ''
         run: |
           if [ -n "${{ matrix.pkgs }}" ]; then sudo apt-get update && sudo apt-get install -y ${{ matrix.pkgs }}; fi
-          if [ -n "${{ matrix.extra_target }}" ]; then rustup target add ${{ matrix.extra_target }}; fi
+          if [ -n "${{ matrix.target }}" ]; then rustup target add ${{ matrix.target }}; fi
       - name: tangle the literate source
         # src/ is gitignored (derived from blueprint.md), so a fresh checkout
         # has no targets; regenerate before building.
