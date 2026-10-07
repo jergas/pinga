@@ -17,31 +17,35 @@ jobs:
         include:
           # Linux ships as a static musl build: it runs on EVERY Linux
           # (glibc and musl alike, incl. NixOS where the glibc loader is a
-          # deliberate stub). macOS ships native per-arch builds.
+          # deliberate stub). macOS ships native per-arch builds; both are
+          # cross-compiled on the arm64 mac runner (Rust handles macOS
+          # cross-arch natively) — no Intel-mac runner needed.
           - os: ubuntu-latest
             asset: pinga-linux-x86_64
             target: x86_64-unknown-linux-musl
             build_dir: target/x86_64-unknown-linux-musl/release
-            apt: musl-tools
-          - os: macos-13
-            asset: pinga-macos-x86_64
-            target: ""
-            build_dir: target/release
-            apt: ""
+            extra_target: ""
+            pkgs: musl-tools
           - os: macos-latest
             asset: pinga-macos-aarch64
             target: ""
             build_dir: target/release
-            apt: ""
+            extra_target: ""
+            pkgs: ""
+          - os: macos-latest
+            asset: pinga-macos-x86_64
+            target: x86_64-apple-darwin
+            build_dir: target/x86_64-apple-darwin/release
+            extra_target: x86_64-apple-darwin
+            pkgs: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: install musl toolchain (linux only)
-        if: matrix.apt != ''
+      - name: install musl toolchain or extra target
+        if: matrix.extra_target != '' || matrix.pkgs != ''
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt }}
-          rustup target add ${{ matrix.target }}
+          if [ -n "${{ matrix.pkgs }}" ]; then sudo apt-get update && sudo apt-get install -y ${{ matrix.pkgs }}; fi
+          if [ -n "${{ matrix.extra_target }}" ]; then rustup target add ${{ matrix.extra_target }}; fi
       - name: tangle the literate source
         # src/ is gitignored (derived from blueprint.md), so a fresh checkout
         # has no targets; regenerate before building.
