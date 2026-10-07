@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Restore the tmux layout after a reboot, independent of tpm/continuum.
+# Runs once at boot via systemd (see pinga-tmux-restore.service).
+#
+# tpm/continuum's automatic restore on server start is unreliable here, so this
+# is the belt-and-suspenders path: it starts a tmux server (if none), runs
+# tmux-resurrect's restore.sh from the latest save, and drops the throwaway
+# session it used to bootstrap the server.
+if ! command -v tmux >/dev/null 2>&1; then exit 0; fi
+
+SAVE="$HOME/.tmux/resurrect/last"
+RESTORE="$HOME/.tmux/plugins/tmux-resurrect/scripts/restore.sh"
+[ -f "$SAVE" ] || exit 0
+[ -f "$RESTORE" ] || exit 0
+
+# Need a tmux server to restore into; start one if none is running.
+started=0
+if ! tmux ls >/dev/null 2>&1; then
+    tmux new-session -d -s __pinga_restore__ >/dev/null 2>&1
+    started=1
+fi
+
+SESSION="$(tmux ls -F '#{session_name}' 2>/dev/null | head -n1)"
+[ -z "$SESSION" ] && exit 0
+
+tmux run-shell -t "$SESSION" "$RESTORE" >/dev/null 2>&1
+
+# Drop the throwaway session we used to bootstrap the server.
+if [ "$started" = 1 ] && tmux has-session -t __pinga_restore__ >/dev/null 2>&1; then
+    tmux kill-session -t __pinga_restore__ >/dev/null 2>&1
+fi
+exit 0

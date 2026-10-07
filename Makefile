@@ -40,25 +40,24 @@ build:
 install: tangle build
 	@install -Dm755 target/release/pinga $(BINDIR)/pinga
 	@install -Dm755 deploy/pinga-tmux-save $(BINDIR)/pinga-tmux-save
+	@install -Dm755 deploy/pinga-tmux-restore $(BINDIR)/pinga-tmux-restore
 	@install -Dm644 deploy/pinga-tmux-save.service $(SYSTEMD_DIR)/pinga-tmux-save.service
 	@install -Dm644 deploy/pinga-tmux-save.timer $(SYSTEMD_DIR)/pinga-tmux-save.timer
+	@install -Dm644 deploy/pinga-tmux-restore.service $(SYSTEMD_DIR)/pinga-tmux-restore.service
 	@echo "installed pinga -> $(BINDIR)/pinga"
-	@echo "installed tmux-save timer -> $(SYSTEMD_DIR)/"
+	@echo "installed tmux-save timer + restore service -> $(SYSTEMD_DIR)/"
 	@if command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload >/dev/null 2>&1; then \
-		if systemctl --user enable --now pinga-tmux-save.timer >/dev/null 2>&1; then \
-			echo "enabled pinga-tmux-save.timer"; \
-		else \
-			echo "warning: could not enable pinga-tmux-save.timer"; \
-		fi \
+		systemctl --user enable --now pinga-tmux-save.timer >/dev/null 2>&1 && echo "enabled pinga-tmux-save.timer" || echo "warning: could not enable pinga-tmux-save.timer"; \
+		systemctl --user enable pinga-tmux-restore.service >/dev/null 2>&1 && echo "enabled pinga-tmux-restore.service (runs at boot)" || echo "warning: could not enable pinga-tmux-restore.service"; \
 	else \
-		echo "note: no systemd user session here; install the timer manually (deploy/pinga-tmux-save.*)"; \
+		echo "note: no systemd user session here; install the units manually (deploy/)"; \
 	fi
 
 uninstall:
-	@rm -f $(BINDIR)/pinga $(BINDIR)/pinga-tmux-save
-	@rm -f $(SYSTEMD_DIR)/pinga-tmux-save.service $(SYSTEMD_DIR)/pinga-tmux-save.timer
+	@rm -f $(BINDIR)/pinga $(BINDIR)/pinga-tmux-save $(BINDIR)/pinga-tmux-restore
+	@rm -f $(SYSTEMD_DIR)/pinga-tmux-save.service $(SYSTEMD_DIR)/pinga-tmux-save.timer $(SYSTEMD_DIR)/pinga-tmux-restore.service
 	@systemctl --user daemon-reload >/dev/null 2>&1 || true
-	@echo "removed pinga + tmux-save timer"
+	@echo "removed pinga + tmux-save timer + restore service"
 
 clean:
 	@rm -rf src target blueprint.html

@@ -1,0 +1,10 @@
+[Unit]
+Description=Restore tmux layout after boot (tmux-resurrect)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/pinga-tmux-restore
+
+[Install]
+WantedBy=default.target

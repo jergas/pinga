@@ -117,3 +117,15 @@ there are no automated tests. `make check/test/lint` do not tangle first; run
 index append on a failed/no-row DB update, although listing ignores that file.
 Codex resume uses resolved display titles, including non-unique inherited
 ancestor labels; do not mistake those labels for stable session identity.
+
+## tmux resurrect/continuum auto-restore does NOT fire on server start (2026-10-03)
+After a reboot, tpm loads NO plugins on a fresh server (no resurrect C-r/C-s
+keys, no continuum status-right interpolation), so `@continuum-restore on`
+never runs — the tmux session is NOT auto-restored. The plugins DO work when
+run manually (`tmux run-shell .../resurrect.tmux`; manual `restore.sh` brings
+the session back). tpm's `run '~/.tmux/plugins/tpm/tpm'` auto-load is broken here.
+Fix: a systemd user service `pinga-tmux-restore` (deploy/, WantedBy=default.target,
+runs at boot) starts a tmux server if none and runs resurrect `restore.sh` from
+`~/.tmux/resurrect/last`. Belt-and-suspenders alongside the save timer
+(`pinga-tmux-save`). `make install` deploys+enables both. Do NOT rely on
+continuum auto-restore for reboot survival.
