@@ -58,3 +58,5 @@ truth.
 - Thin client: remote connection manager — per-host ssh keys, key
   installation, BatchMode probes, and `pinga remote connect` into a remote
   console (validated mac → eris).
+- Repository governance: AGPLv3-or-later LICENSE, roadmap, HISTORY changelog
+  policy, README rewrite, agent changelog policy.
