@@ -4,6 +4,9 @@ After=network.target
 
 [Service]
 Type=oneshot
+# NixOS: user units get a minimal PATH without /run/current-system/sw/bin
+# (tmux lives there). Keep the standard dirs + the user bin dir.
+Environment=PATH=/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:%h/.local/bin
 # RemainAfterExit keeps the unit active (exited) after the script returns, so
 # systemd does NOT tear down the unit's cgroup — which would kill the tmux
 # server the script spawned, silently discarding the restored layout

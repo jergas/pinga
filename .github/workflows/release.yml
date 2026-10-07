@@ -15,27 +15,45 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux ships as a static musl build: it runs on EVERY Linux
+          # (glibc and musl alike, incl. NixOS where the glibc loader is a
+          # deliberate stub). macOS ships native per-arch builds.
           - os: ubuntu-latest
             asset: pinga-linux-x86_64
+            target: x86_64-unknown-linux-musl
+            build_dir: target/x86_64-unknown-linux-musl/release
+            apt: musl-tools
           - os: macos-13
             asset: pinga-macos-x86_64
+            target: ""
+            build_dir: target/release
+            apt: ""
           - os: macos-latest
             asset: pinga-macos-aarch64
+            target: ""
+            build_dir: target/release
+            apt: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - name: install musl toolchain (linux only)
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+          rustup target add ${{ matrix.target }}
+      - run: cargo build --release ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
       - name: package asset + checksum
         run: |
-          cd target/release
+          cd ${{ matrix.build_dir }}
           if command -v sha256sum >/dev/null 2>&1; then sha256sum pinga; else shasum -a 256 pinga; fi > "${{ matrix.asset }}.sha256"
           cp pinga "${{ matrix.asset }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: |
-            target/release/${{ matrix.asset }}
-            target/release/${{ matrix.asset }}.sha256
+            ${{ matrix.build_dir }}/${{ matrix.asset }}
+            ${{ matrix.build_dir }}/${{ matrix.asset }}.sha256
 
   deploy-bundle:
     name: package deploy units
