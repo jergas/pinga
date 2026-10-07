@@ -2,13 +2,18 @@
 # pinga installer — one script, every platform.
 #
 # Downloads the prebuilt pinga binary for this OS/arch from GitHub releases,
-# verifies its sha256, installs it, and on Linux with systemd also deploys and
-# enables the boot units (resurrect restore, save timer, bring-up).
+# verifies its sha256, confirms the binary actually executes on this host,
+# installs it, and on Linux with systemd also deploys and enables the boot units
+# (resurrect restore, save timer, bring-up).
 #
 # Works on Linux and macOS (POSIX sh; curl required). Windows is not
 # supported: pinga's console and bring-up need tmux, systemd and /proc — use a
 # Linux/macOS host or WSL, or `pinga remote connect` from any ssh-capable
 # machine.
+#
+# A host that cannot run the release binary (a non-glibc ELF loader, e.g. NixOS)
+# is rejected before anything is installed, with the source-build command as the
+# remedy. See the verify step below.
 #
 # Overrides:
 #   PINGA_REPO=user/repo   default: jergas/pinga
@@ -69,6 +74,30 @@ else
     die "no sha256 tool found"
 fi
 ( cd "$tmp" && $CHECK "$ASSET.sha256" ) >/dev/null || die "checksum mismatch — refusing to install"
+
+# ---- verify the artifact can actually run here -------------------------------
+# A correct checksum only proves the download is intact, not that the host can
+# execute it. Release binaries are linked against glibc, and a system whose
+# /lib64 ELF loader is not that glibc cannot run them at all -- NixOS is the
+# common case, where /lib64/ld-linux-x86-64.so.2 is a deliberate stub that only
+# prints an explanation. Without this check such a host gets a cheerful "done"
+# followed by a binary that cannot start. Test before installing, not after, so
+# a bad host is never left with an unusable pinga in place.
+chmod +x "$tmp/$ASSET"
+if ! "$tmp/$ASSET" --version >/dev/null 2>&1; then
+    say "error: the downloaded $ASSET cannot execute on this system." >&2
+    _out="$("$tmp/$ASSET" --version 2>&1 || true)"
+    if [ -n "$_out" ]; then
+        printf '%s\n' "$_out" | sed 's/^/pinga-installer:   /' >&2
+    fi
+    say "The checksum matched, so the download is intact -- this host simply" >&2
+    say "cannot run it. The usual cause is a C library mismatch: the release is" >&2
+    say "linked against glibc, and this system provides a different ELF loader." >&2
+    say "Build from source instead, which links against the local toolchain:" >&2
+    say "  git clone https://github.com/${REPO} && cd pinga && make install" >&2
+    die "aborting without installing"
+fi
+say "verified $("$tmp/$ASSET" --version 2>/dev/null | head -1)"
 
 install -m755 "$tmp/$ASSET" "$BINDIR/pinga"
 say "installed $BINDIR/pinga"

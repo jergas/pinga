@@ -145,3 +145,21 @@ open — close and reopen such windows via pinga.
 (stale ids after tmux-resurrect restore). A dead window's pane lookup failed
 and marked the whole snapshot incomplete → EVERY open refused ("cannot inspect
 running windows right now"). Fixed: only alive tracked windows are scanned.
+
+## pinga: a checksum-valid release binary can still be unrunnable (fixed 2026-10-06)
+The installer verified sha256 and then installed, which proves the download is
+intact but says nothing about whether the HOST can execute it. Release binaries
+are linked against glibc; NixOS ships a deliberate stub at
+`/lib64/ld-linux-x86-64.so.2` that only prints an explanation, so every release
+installs "successfully" and then fails with exit 127. Observed on eris's NixOS
+install: install.sh printed "done", `pinga` was "command not found" or the stub
+ld message, and `pinga-up.service` failed with status=127. Fixed by running the
+downloaded artifact with `--version` BEFORE `install`, and refusing with the
+source-build remedy if it cannot start. General lesson: any installer that
+downloads a native binary should execute-test it, not only checksum it — the
+failure class is wider than NixOS (musl hosts, wrong-arch, wrong-libc).
+
+Also note on NixOS specifically: `pinga up` additionally needs `tmux`, and it is
+not enough for tmux to be merely installed — the systemd user unit runs with a
+minimal PATH that does not include /run/current-system/sw/bin, so the unit needs
+an explicit `PATH=` or the units must be managed by NixOS with `path` set.
